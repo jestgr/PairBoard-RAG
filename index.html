@@ -165,6 +165,9 @@ textarea{font-family:var(--font-ui);}
 .dqa-banner.warn{background:var(--warning-bg);color:var(--warning);}
 .dqa-banner.info{background:var(--info-bg);color:var(--info);}
 .dqa-input-row{display:flex;align-items:flex-end;gap:var(--s-2);padding:var(--s-3) var(--s-4);padding-bottom:max(var(--s-3),env(safe-area-inset-bottom));background:var(--bg-surface);border-top:1px solid var(--border-default);flex-shrink:0;}
+.dqa-model-status{font-size:var(--text-caption);padding:5px var(--s-4);text-align:center;flex-shrink:0;cursor:pointer;border-top:1px solid var(--border-subtle);}
+.dqa-model-status.ready{background:var(--success-bg);color:var(--success);}
+.dqa-model-status.retrieval{background:var(--bg-subtle);color:var(--text-tertiary);}
 .dqa-textarea{flex:1;resize:none;border:1px solid var(--border-default);border-radius:var(--r-2xl);padding:10px var(--s-4);background:var(--bg-app);color:var(--text-primary);font-size:var(--text-base);line-height:1.4;outline:none;max-height:120px;min-height:42px;transition:border-color var(--dur-fast) var(--ease-out);}
 .dqa-textarea:focus{border-color:var(--accent);}
 .dqa-textarea::placeholder{color:var(--text-quaternary);}
@@ -355,6 +358,7 @@ textarea{font-family:var(--font-ui);}
         </div>
       </div>
     </div>
+    <div class="dqa-model-status" id="dqa-model-status" onclick="window._DQA.gotoModels()"></div>
     <div class="dqa-input-row">
       <textarea class="dqa-textarea" id="dqa-input" placeholder="Ask a question…" rows="1"></textarea>
       <button class="dqa-send" id="dqa-send" disabled>
@@ -1002,6 +1006,9 @@ const LLM = {
     try{return !!(await navigator.gpu?.requestAdapter());}catch{return false;}
   },
 
+  // Single source of truth for load state — used by BOTH picker and chat
+  isLoaded(){ return !!(ST.llmReady && ST.llm); },
+
   async load(onProgress){
     // esm.run is WebLLM's recommended CDN; esm.sh can't bundle WASM dependencies
     const webllm = await import('https://esm.run/@mlc-ai/web-llm');
@@ -1009,6 +1016,7 @@ const LLM = {
       initProgressCallback: p => onProgress(Math.round((p.progress??0)*100))
     });
     ST.llmReady = true;
+    UI.refreshModelStatus();
   },
 
   buildMessages(query,chunks){
@@ -1272,8 +1280,17 @@ const UI = {
         document.querySelectorAll('.dqa-tab,.dqa-panel').forEach(el=>el.classList.remove('active'));
         btn.classList.add('active');
         document.getElementById(`dqa-panel-${btn.dataset.tab}`).classList.add('active');
+        if(btn.dataset.tab==='chat') this.refreshModelStatus();
+        if(btn.dataset.tab==='models') this.renderModelPicker();
       });
     });
+  },
+
+  gotoModels(){
+    document.querySelectorAll('.dqa-tab,.dqa-panel').forEach(el=>el.classList.remove('active'));
+    document.querySelector('.dqa-tab[data-tab="models"]').classList.add('active');
+    document.getElementById('dqa-panel-models').classList.add('active');
+    this.renderModelPicker();
   },
 
   setStatus(label,state){
@@ -1375,7 +1392,7 @@ const UI = {
       this.setThinkLabel('Searching knowledge base…');
       chunks=await SEARCH.retrieve(query);
       let rawAnswer,llmUsed=false;
-      if(ST.llmReady){
+      if(LLM.isLoaded()){
         this.setThinkLabel('Synthesizing answer…');
         rawAnswer=await LLM.synthesize(query,chunks);
         llmUsed=true;
@@ -1437,6 +1454,25 @@ const UI = {
   },
 
   setSendEnabled(v){document.getElementById('dqa-send').disabled=!v;},
+
+  refreshModelStatus(){
+    const el = document.getElementById('dqa-model-status');
+    if(!el) return;
+    if(!ST.webgpuOk){
+      el.className='dqa-model-status retrieval';
+      el.textContent='⚡ Retrieval-only · this device has no WebGPU';
+      return;
+    }
+    if(LLM.isLoaded()){
+      const m = MODELCAT.find(x=>x.id===CFG.LLM_MODEL);
+      el.className='dqa-model-status ready';
+      el.textContent=`✦ ${m?m.name:'Model'} loaded · full synthesis active`;
+    } else {
+      const m = MODELCAT.find(x=>x.id===CFG.LLM_MODEL);
+      el.className='dqa-model-status retrieval';
+      el.textContent=`⚡ Retrieval-only · tap to load ${m?m.name:'a model'} for synthesis`;
+    }
+  },
 
   updateSendState(){
     const ta=document.getElementById('dqa-input');
@@ -1623,7 +1659,7 @@ const UI = {
       const selected = m.id===CFG.LLM_MODEL;
       // "Loaded" requires BOTH the ready flag AND a live engine object —
       // prevents showing Loaded after a refresh cleared the engine.
-      const loaded   = selected && ST.llmReady && !!ST.llm;
+      const loaded   = selected && LLM.isLoaded();
       let action;
       if(!compat){
         action = `<div class="dqa-mp-incompat-reason">Needs more GPU memory than this device provides</div>`;
@@ -1664,6 +1700,7 @@ const UI = {
     localStorage.setItem(CFG.MODEL_PREF_KEY, id);
     ST.llmReady = false; ST.llm = null;
     this.renderModelPicker();
+    this.refreshModelStatus();
   },
 
   async loadModel(id){
@@ -1676,6 +1713,7 @@ const UI = {
     try{
       await LLM.load(p=>{ if(fill) fill.style.width=p+'%'; });
       this.renderModelPicker();
+      this.refreshModelStatus();
     }catch(err){
       if(btn){ btn.disabled=false; btn.textContent='Retry'; }
       alert(`Model load failed: ${err.message}`);
@@ -1835,12 +1873,14 @@ async function init(){
   UI.renderDocs();
   UI.refreshBanners();
   UI.setStatus('OFFLINE','');
+  UI.refreshModelStatus();
 
   window._DQA = {
     removeDoc:    id=>UI.removeDoc(id),
     resumeDoc:    id=>UI.resumeDoc(id),
     discardDoc:   id=>UI.discardDoc(id),
     openContext:  id=>CONTEXT.open(id),
+    gotoModels:   ()=>UI.gotoModels(),
     retryQuery:   q=>UI.retryQuery(q),
     selectModel:  id=>UI.selectModel(id),
     loadModel:    id=>UI.loadModel(id),
