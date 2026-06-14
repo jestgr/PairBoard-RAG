@@ -530,7 +530,8 @@ const CFG = {
   CHUNK_WORDS:       200,
   CHUNK_OVERLAP:     50,
   INGEST_BATCH:      20,
-  TOP_K:             12,    // ↑ from 6 — more passages = better coverage
+  TOP_K:             12,    // passages retrieved & shown as sources
+  LLM_CONTEXT_K:     6,     // passages actually fed to LLM (smaller = less GPU pressure)
   MAX_TOKENS:        1200,  // ↑ from 700 — allow fuller answers
   GOLDEN_THRESHOLD:  0.82,  // cosine similarity to trigger golden pair injection
   EMBED_MODEL:       'Xenova/all-MiniLM-L6-v2',
@@ -1070,8 +1071,11 @@ const LLM = {
   },
 
   async _call(query,chunks){
+    // Feed only the top LLM_CONTEXT_K chunks to the model (smaller GPU buffer);
+    // the full set is still shown to the user as sources.
+    const ctx = chunks.slice(0, CFG.LLM_CONTEXT_K);
     const resp = await ST.llm.chat.completions.create({
-      messages:this.buildMessages(query,chunks),temperature:0.1,max_tokens:CFG.MAX_TOKENS
+      messages:this.buildMessages(query,ctx),temperature:0.1,max_tokens:CFG.MAX_TOKENS
     });
     return resp.choices[0].message.content;
   }
@@ -1428,14 +1432,23 @@ const UI = {
           </div>`).join('')}</div>
         </div>`;
       } else if(LLM.isLoaded() && chunks){
-        // Model IS loaded but synthesis threw — surface the REAL error, don't
-        // pretend the model isn't loaded. Show retrieval + the actual fault.
+        // Model IS loaded but synthesis threw — surface the REAL error.
         const feedbackId=await FEEDBACK.log(query,chunks,'synthesis_error: '+msg,false);
+        // GPU buffer crashes often clear if a SMALLER model is used. Offer that.
+        const cur = MODELCAT.find(m=>m.id===CFG.LLM_MODEL);
+        const smaller = MODELCAT.find(m=>LLM.isCompatible(m) &&
+          MODELCAT.indexOf(m) < MODELCAT.indexOf(cur));
+        const gpuCrash = msg.includes('mapAsync')||msg.includes('GPUBuffer')||msg.includes('unmapped');
+        const suggestion = (gpuCrash && smaller)
+          ? `<div class="dqa-alert info" style="margin:8px 0">This looks like a GPU memory limit on this device. A smaller model often works — tap below to switch to ${smaller.name}.</div>
+             <button class="dqa-btn dqa-btn-primary dqa-btn-sm" style="margin-bottom:8px"
+               onclick="window._DQA.switchAndLoad('${smaller.id}')">Switch to ${smaller.name} &amp; load</button>`
+          : `<button class="dqa-btn dqa-btn-primary dqa-btn-sm" style="margin:8px 0"
+               onclick="window._DQA.retryQuery('${query.replace(/'/g,"\\'")}')">↻ Retry</button>`;
         answerHtml=`<div class="dqa-bubble">
           <div class="dqa-mode-tag">⚠ Synthesis failed · showing retrieval</div>
-          <div class="dqa-summary">The model is loaded but generation failed with:\n\n<span style="color:var(--danger);font-family:var(--font-mono);font-size:12px">${msg}</span>\n\nThe relevant passages are below. Tap retry to try again.</div>
-          <button class="dqa-btn dqa-btn-primary dqa-btn-sm" style="margin:8px 0"
-            onclick="window._DQA.retryQuery('${query.replace(/'/g,"\\'")}')">↻ Retry</button>
+          <div class="dqa-summary">The model loaded but generation failed:\n\n<span style="color:var(--danger);font-family:var(--font-mono);font-size:12px">${msg}</span></div>
+          ${suggestion}
           <div class="dqa-citations-label">Sources</div>
           <div class="dqa-citations">${chunks.map(c=>`<div class="dqa-citation" onclick="window._DQA.openContext('${c.id}')">
             <div class="dqa-citation-source">📄 ${c.docName} — p.${c.page}</div>
@@ -1903,6 +1916,15 @@ async function init(){
     discardDoc:   id=>UI.discardDoc(id),
     openContext:  id=>CONTEXT.open(id),
     gotoModels:   ()=>UI.gotoModels(),
+    switchAndLoad: async id=>{
+      const m=MODELCAT.find(x=>x.id===id); if(!m) return;
+      CFG.LLM_MODEL=id;
+      localStorage.setItem(CFG.MODEL_PREF_KEY,id);
+      ST.llmReady=false; ST.llm=null;
+      UI.refreshModelStatus();
+      UI.gotoModels();
+      await UI.loadModel(id);
+    },
     retryQuery:   q=>UI.retryQuery(q),
     selectModel:  id=>UI.selectModel(id),
     loadModel:    id=>UI.loadModel(id),
