@@ -1,0 +1,1939 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="DocQA">
+<meta name="theme-color" content="#0B2545" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+<link rel="manifest" href="manifest.json">
+<title>DocQA — PairBoard</title>
+
+<!-- ============================================================
+     DocQA Module — v0.2
+     Changes from v0.1:
+       - Progressive chunk save (batch of 20); crash-safe import
+       - Interrupted import detection + resume / discard on startup
+       - Feedback logging (query · chunks · answer · rating)
+       - Chunk X of N live counter during embedding
+       - DB bumped to v2 (adds feedback store; existing data unaffected)
+     ============================================================ -->
+
+<script>
+(function(){
+  try {
+    var s=localStorage.getItem('pb.theme')||'system';
+    var t=s==='system'?(window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'):s;
+    document.documentElement.setAttribute('data-theme',t);
+    document.documentElement.setAttribute('data-theme-preference',s);
+  } catch(e){ document.documentElement.setAttribute('data-theme','light'); }
+})();
+</script>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+
+<style>
+/* ============================================================ TOKENS */
+:root {
+  --font-ui:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',system-ui,'Helvetica Neue',Arial,sans-serif;
+  --font-mono:ui-monospace,'SF Mono',Menlo,'Cascadia Mono',Consolas,monospace;
+  --text-caption:11px; --text-footnote:12px; --text-sm:13px;
+  --text-base:15px; --text-md:17px; --text-lg:20px;
+  --s-1:4px; --s-2:8px; --s-3:12px; --s-4:16px; --s-5:20px; --s-6:24px; --s-7:32px;
+  --r-sm:6px; --r-md:8px; --r-lg:10px; --r-xl:14px; --r-2xl:18px; --r-full:9999px;
+  --dur-fast:150ms; --dur-base:220ms; --ease-out:cubic-bezier(0.2,0.8,0.2,1);
+  /* light defaults */
+  --bg-app:#F5F5F7; --bg-surface:#FFF; --bg-elevated:#FFF;
+  --bg-subtle:#F0F0F2; --bg-hover:rgba(0,0,0,.04);
+  --border-subtle:rgba(60,60,67,.08); --border-default:rgba(60,60,67,.14);
+  --text-primary:#0A0A0C; --text-secondary:#2A2A2E;
+  --text-tertiary:rgba(28,28,30,.74); --text-quaternary:rgba(28,28,30,.54);
+  --text-on-accent:#FFF;
+  --accent:#0B2545; --accent-hover:#163461; --accent-active:#081a32;
+  --accent-subtle:rgba(11,37,69,.08); --accent-muted:rgba(11,37,69,.6);
+  --success:#1E8F47; --success-bg:rgba(30,143,71,.10);
+  --warning:#B86E00; --warning-bg:rgba(184,110,0,.10);
+  --danger:#B3261E; --danger-bg:rgba(179,38,30,.10);
+  --info:#0B5CAD; --info-bg:rgba(11,92,173,.10);
+  --shadow-sm:0 1px 2px rgba(0,0,0,.04),0 0 0 1px rgba(0,0,0,.03);
+  --shadow-md:0 2px 8px rgba(0,0,0,.06),0 0 0 1px rgba(0,0,0,.04);
+}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg-app:#000; --bg-surface:#1C1C1E; --bg-elevated:#2C2C2E;
+  --bg-subtle:#161618; --bg-hover:rgba(255,255,255,.06);
+  --border-subtle:rgba(255,255,255,.06); --border-default:rgba(255,255,255,.12);
+  --text-primary:#F5F5F7; --text-secondary:rgba(235,235,245,.80);
+  --text-tertiary:rgba(235,235,245,.55); --text-quaternary:rgba(235,235,245,.35);
+  --accent:#4A7FB8; --accent-hover:#5E93CC; --accent-active:#3A6FA8;
+  --accent-subtle:rgba(74,127,184,.16); --accent-muted:rgba(74,127,184,.7);
+  --success:#30D158; --success-bg:rgba(48,209,88,.18);
+  --warning:#FF9F0A; --warning-bg:rgba(255,159,10,.18);
+  --danger:#FF453A; --danger-bg:rgba(255,69,58,.18);
+  --info:#64A8FF; --info-bg:rgba(100,168,255,.18);
+  --shadow-sm:0 1px 2px rgba(0,0,0,.4),0 0 0 1px rgba(255,255,255,.04);
+  --shadow-md:0 4px 12px rgba(0,0,0,.5),0 0 0 1px rgba(255,255,255,.05);
+}}
+[data-theme="light"]{
+  --bg-app:#F5F5F7; --bg-surface:#FFF; --bg-subtle:#F0F0F2;
+  --border-subtle:rgba(60,60,67,.08); --border-default:rgba(60,60,67,.14);
+  --text-primary:#0A0A0C; --text-secondary:#2A2A2E;
+  --text-tertiary:rgba(28,28,30,.74); --text-quaternary:rgba(28,28,30,.54);
+  --accent:#0B2545; --accent-hover:#163461; --accent-subtle:rgba(11,37,69,.08);
+  --success:#1E8F47; --success-bg:rgba(30,143,71,.10);
+  --warning:#B86E00; --warning-bg:rgba(184,110,0,.10);
+  --danger:#B3261E; --danger-bg:rgba(179,38,30,.10);
+  --shadow-sm:0 1px 2px rgba(0,0,0,.04),0 0 0 1px rgba(0,0,0,.03);
+}
+[data-theme="dark"]{
+  --bg-app:#000; --bg-surface:#1C1C1E; --bg-subtle:#161618;
+  --border-subtle:rgba(255,255,255,.06); --border-default:rgba(255,255,255,.12);
+  --text-primary:#F5F5F7; --text-secondary:rgba(235,235,245,.80);
+  --text-tertiary:rgba(235,235,245,.55); --text-quaternary:rgba(235,235,245,.35);
+  --accent:#4A7FB8; --accent-hover:#5E93CC; --accent-subtle:rgba(74,127,184,.16);
+  --success:#30D158; --success-bg:rgba(48,209,88,.18);
+  --warning:#FF9F0A; --warning-bg:rgba(255,159,10,.18);
+  --danger:#FF453A; --danger-bg:rgba(255,69,58,.18);
+  --shadow-sm:0 1px 2px rgba(0,0,0,.4),0 0 0 1px rgba(255,255,255,.04);
+}
+
+/* ============================================================ RESET */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+html,body{height:100%;font-family:var(--font-ui);background:var(--bg-app);color:var(--text-primary);-webkit-text-size-adjust:none;}
+button{font-family:var(--font-ui);cursor:pointer;-webkit-tap-highlight-color:transparent;}
+textarea{font-family:var(--font-ui);}
+
+/* ============================================================ LAYOUT */
+.dqa-app{display:flex;flex-direction:column;height:100dvh;max-width:800px;margin:0 auto;background:var(--bg-app);}
+
+/* ============================================================ HEADER */
+.dqa-header{display:flex;align-items:center;justify-content:space-between;padding:var(--s-3) var(--s-4);padding-top:max(var(--s-3),env(safe-area-inset-top));background:var(--bg-surface);border-bottom:1px solid var(--border-default);flex-shrink:0;}
+.dqa-header-left{display:flex;align-items:center;gap:var(--s-3);}
+.dqa-header-icon{width:32px;height:32px;border-radius:var(--r-lg);background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0;}
+.dqa-header-title{font-size:var(--text-md);font-weight:600;letter-spacing:-.3px;}
+.dqa-header-sub{font-size:var(--text-caption);color:var(--text-tertiary);margin-top:1px;}
+.dqa-status-pill{display:flex;align-items:center;gap:var(--s-1);font-size:var(--text-caption);font-weight:600;padding:3px 9px;border-radius:var(--r-full);background:var(--bg-subtle);color:var(--text-tertiary);letter-spacing:.4px;transition:all var(--dur-fast) var(--ease-out);}
+.dqa-status-pill.ready{background:var(--success-bg);color:var(--success);}
+.dqa-status-pill.loading{background:var(--warning-bg);color:var(--warning);}
+.dqa-status-dot{width:6px;height:6px;border-radius:50%;background:currentColor;flex-shrink:0;}
+.dqa-status-dot.pulse{animation:dqa-pulse 1.5s infinite;}
+@keyframes dqa-pulse{0%,100%{opacity:1}50%{opacity:.3}}
+
+/* ============================================================ TABS */
+.dqa-tabs{display:flex;background:var(--bg-surface);border-bottom:1px solid var(--border-default);flex-shrink:0;}
+.dqa-tab{flex:1;padding:10px var(--s-2);text-align:center;font-size:var(--text-footnote);font-weight:500;color:var(--text-tertiary);border:none;background:none;border-bottom:2px solid transparent;transition:color var(--dur-fast) var(--ease-out),border-color var(--dur-fast) var(--ease-out);}
+.dqa-tab.active{color:var(--accent);border-bottom-color:var(--accent);font-weight:600;}
+
+/* ============================================================ PANELS */
+.dqa-panel{display:none;flex:1;overflow:hidden;flex-direction:column;}
+.dqa-panel.active{display:flex;}
+.dqa-scroll{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;}
+
+/* ============================================================ CHAT */
+.dqa-chat-thread{padding:var(--s-4);display:flex;flex-direction:column;gap:var(--s-4);min-height:100%;}
+.dqa-empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:var(--s-7);gap:var(--s-3);color:var(--text-tertiary);min-height:300px;}
+.dqa-empty-icon{font-size:44px;margin-bottom:var(--s-1);}
+.dqa-empty-title{font-size:var(--text-md);font-weight:600;color:var(--text-secondary);}
+.dqa-empty-body{font-size:var(--text-sm);line-height:1.55;max-width:280px;}
+.dqa-msg{display:flex;flex-direction:column;max-width:88%;}
+.dqa-msg.user{align-self:flex-end;align-items:flex-end;}
+.dqa-msg.ai{align-self:flex-start;align-items:flex-start;}
+.dqa-bubble{padding:var(--s-3) var(--s-4);border-radius:var(--r-2xl);font-size:var(--text-base);line-height:1.5;box-shadow:var(--shadow-sm);}
+.dqa-msg.user .dqa-bubble{background:var(--accent);color:var(--text-on-accent);border-bottom-right-radius:var(--r-sm);}
+.dqa-msg.ai .dqa-bubble{background:var(--bg-surface);color:var(--text-primary);border-bottom-left-radius:var(--r-sm);}
+.dqa-mode-tag{font-size:var(--text-caption);color:var(--text-quaternary);margin-bottom:var(--s-2);display:flex;align-items:center;gap:var(--s-1);}
+.dqa-summary{font-size:var(--text-base);line-height:1.6;white-space:pre-wrap;}
+.dqa-citations-label{font-size:var(--text-caption);font-weight:600;color:var(--text-tertiary);text-transform:uppercase;letter-spacing:.5px;margin:var(--s-3) 0 var(--s-2);}
+.dqa-citations{display:flex;flex-direction:column;gap:var(--s-2);}
+.dqa-citation{background:var(--bg-subtle);border-radius:var(--r-lg);padding:var(--s-2) var(--s-3);border-left:3px solid var(--accent);}
+.dqa-citation-source{font-size:var(--text-caption);font-weight:600;color:var(--accent);margin-bottom:3px;}
+.dqa-citation-quote{font-size:var(--text-footnote);color:var(--text-tertiary);font-style:italic;line-height:1.45;}
+.dqa-rating-row{display:flex;align-items:center;gap:var(--s-2);margin-top:var(--s-2);}
+.dqa-rate-btn{background:none;border:1px solid var(--border-default);border-radius:var(--r-full);padding:3px 10px;font-size:var(--text-caption);color:var(--text-tertiary);transition:all var(--dur-fast);}
+.dqa-rate-btn:hover{border-color:var(--accent);color:var(--accent);}
+.dqa-rate-btn.up.active{background:var(--success-bg);color:var(--success);border-color:var(--success);}
+.dqa-rate-btn.down.active{background:var(--danger-bg);color:var(--danger);border-color:var(--danger);}
+.dqa-rate-label{font-size:var(--text-caption);color:var(--text-quaternary);}
+.dqa-thinking{display:flex;align-items:center;gap:var(--s-2);font-size:var(--text-sm);color:var(--text-tertiary);}
+.dqa-dots{display:flex;gap:4px;}
+.dqa-dots span{width:6px;height:6px;border-radius:50%;background:currentColor;opacity:.6;animation:dqa-bounce 1.2s infinite;}
+.dqa-dots span:nth-child(2){animation-delay:.15s}.dqa-dots span:nth-child(3){animation-delay:.3s}
+@keyframes dqa-bounce{0%,80%,100%{transform:translateY(0)}40%{transform:translateY(-5px)}}
+.dqa-banner{font-size:var(--text-caption);font-weight:500;padding:5px var(--s-4);text-align:center;flex-shrink:0;}
+.dqa-banner.warn{background:var(--warning-bg);color:var(--warning);}
+.dqa-banner.info{background:var(--info-bg);color:var(--info);}
+.dqa-input-row{display:flex;align-items:flex-end;gap:var(--s-2);padding:var(--s-3) var(--s-4);padding-bottom:max(var(--s-3),env(safe-area-inset-bottom));background:var(--bg-surface);border-top:1px solid var(--border-default);flex-shrink:0;}
+.dqa-textarea{flex:1;resize:none;border:1px solid var(--border-default);border-radius:var(--r-2xl);padding:10px var(--s-4);background:var(--bg-app);color:var(--text-primary);font-size:var(--text-base);line-height:1.4;outline:none;max-height:120px;min-height:42px;transition:border-color var(--dur-fast) var(--ease-out);}
+.dqa-textarea:focus{border-color:var(--accent);}
+.dqa-textarea::placeholder{color:var(--text-quaternary);}
+.dqa-send{width:38px;height:38px;border-radius:50%;background:var(--accent);border:none;flex-shrink:0;display:flex;align-items:center;justify-content:center;transition:background var(--dur-fast) var(--ease-out),opacity var(--dur-fast);}
+.dqa-send:disabled{opacity:.35;cursor:default;}
+.dqa-send svg{width:16px;height:16px;fill:var(--text-on-accent);}
+
+/* ============================================================ CONTEXT SHEET */
+.dqa-sheet-backdrop{
+  position:fixed;inset:0;background:rgba(0,0,0,.45);
+  z-index:200;opacity:0;pointer-events:none;
+  transition:opacity var(--dur-base) var(--ease-out);
+  backdrop-filter:blur(2px);-webkit-backdrop-filter:blur(2px);
+}
+.dqa-sheet-backdrop.open{opacity:1;pointer-events:auto;}
+.dqa-sheet{
+  position:fixed;bottom:0;left:0;right:0;
+  max-width:800px;margin:0 auto;
+  background:var(--bg-surface);
+  border-radius:var(--r-2xl) var(--r-2xl) 0 0;
+  z-index:201;
+  max-height:82dvh;display:flex;flex-direction:column;
+  transform:translateY(100%);transition:transform var(--dur-base) var(--ease-out);
+  padding-bottom:max(var(--s-4),env(safe-area-inset-bottom));
+}
+.dqa-sheet.open{transform:translateY(0);}
+.dqa-sheet-handle{
+  width:36px;height:4px;border-radius:2px;
+  background:var(--border-default);margin:var(--s-2) auto var(--s-3);flex-shrink:0;
+}
+.dqa-sheet-header{
+  display:flex;align-items:flex-start;justify-content:space-between;
+  padding:0 var(--s-4) var(--s-3);flex-shrink:0;
+  border-bottom:1px solid var(--border-subtle);
+}
+.dqa-sheet-title{font-size:var(--text-base);font-weight:600;line-height:1.3;}
+.dqa-sheet-sub{font-size:var(--text-caption);color:var(--text-tertiary);margin-top:2px;}
+.dqa-sheet-close{
+  background:var(--bg-subtle);border:none;border-radius:var(--r-full);
+  width:28px;height:28px;display:flex;align-items:center;justify-content:center;
+  font-size:14px;color:var(--text-tertiary);flex-shrink:0;margin-left:var(--s-2);
+}
+.dqa-sheet-scroll{overflow-y:auto;-webkit-overflow-scrolling:touch;flex:1;padding:var(--s-3) var(--s-4);}
+.dqa-ctx-block{border-radius:var(--r-xl);padding:var(--s-3) var(--s-4);margin-bottom:var(--s-2);}
+.dqa-ctx-block.prev,.dqa-ctx-block.next{background:var(--bg-subtle);opacity:.7;}
+.dqa-ctx-block.current{
+  background:var(--accent-subtle);
+  border:1.5px solid var(--accent-muted);
+}
+.dqa-ctx-label{
+  font-size:var(--text-caption);font-weight:600;letter-spacing:.4px;
+  text-transform:uppercase;margin-bottom:var(--s-1);
+}
+.dqa-ctx-block.prev .dqa-ctx-label,.dqa-ctx-block.next .dqa-ctx-label{color:var(--text-quaternary);}
+.dqa-ctx-block.current .dqa-ctx-label{color:var(--accent);}
+.dqa-ctx-page{font-size:var(--text-caption);color:var(--text-tertiary);margin-bottom:var(--s-2);}
+.dqa-ctx-text{font-size:var(--text-sm);line-height:1.65;color:var(--text-primary);}
+.dqa-ctx-block.prev .dqa-ctx-text,.dqa-ctx-block.next .dqa-ctx-text{color:var(--text-tertiary);}
+.dqa-ctx-divider{text-align:center;font-size:var(--text-caption);color:var(--text-quaternary);padding:var(--s-1) 0;}
+
+/* Make citation cards tappable */
+.dqa-citation{cursor:pointer;transition:border-color var(--dur-fast),background var(--dur-fast);}
+.dqa-citation:hover,.dqa-citation:active{border-color:var(--accent-muted);background:var(--accent-subtle);}
+.dqa-citation-tap{font-size:var(--text-caption);color:var(--text-quaternary);margin-top:var(--s-1);}
+
+/* ============================================================ DOCS */
+.dqa-docs-scroll{padding:var(--s-4);display:flex;flex-direction:column;gap:var(--s-4);}
+.dqa-section-header{display:flex;align-items:center;justify-content:space-between;}
+.dqa-section-title{font-size:var(--text-base);font-weight:600;}
+.dqa-label{font-size:var(--text-caption);font-weight:600;color:var(--text-tertiary);text-transform:uppercase;letter-spacing:.5px;margin-bottom:var(--s-2);}
+.dqa-stats{display:flex;gap:var(--s-2);}
+.dqa-stat{flex:1;background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--r-xl);padding:var(--s-3) var(--s-2);text-align:center;box-shadow:var(--shadow-sm);}
+.dqa-stat-num{font-size:var(--text-lg);font-weight:700;color:var(--accent);}
+.dqa-stat-lbl{font-size:var(--text-caption);color:var(--text-tertiary);font-weight:500;margin-top:2px;}
+.dqa-doc-list{display:flex;flex-direction:column;gap:var(--s-2);}
+.dqa-doc-card{background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--r-xl);padding:var(--s-3) var(--s-4);display:flex;align-items:center;gap:var(--s-3);box-shadow:var(--shadow-sm);}
+.dqa-doc-icon{font-size:22px;flex-shrink:0;}
+.dqa-doc-info{flex:1;min-width:0;}
+.dqa-doc-name{font-size:var(--text-sm);font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.dqa-doc-meta{font-size:var(--text-caption);color:var(--text-tertiary);margin-top:2px;}
+.dqa-doc-progress{height:3px;background:var(--bg-subtle);border-radius:2px;margin-top:6px;overflow:hidden;}
+.dqa-doc-progress-fill{height:100%;background:var(--accent);border-radius:2px;transition:width .3s;}
+.dqa-chip{font-size:var(--text-caption);font-weight:600;padding:2px 8px;border-radius:var(--r-full);flex-shrink:0;}
+.dqa-chip.ok{background:var(--success-bg);color:var(--success);}
+.dqa-chip.busy{background:var(--warning-bg);color:var(--warning);}
+.dqa-chip.err{background:var(--danger-bg);color:var(--danger);}
+.dqa-chip.interrupted{background:var(--info-bg);color:var(--info);}
+.dqa-doc-empty{font-size:var(--text-sm);color:var(--text-tertiary);text-align:center;padding:var(--s-7) 0;line-height:1.6;}
+.dqa-resume-actions{display:flex;gap:var(--s-2);margin-top:var(--s-2);}
+
+/* ============================================================ MODELS */
+.dqa-models-scroll{padding:var(--s-4);display:flex;flex-direction:column;gap:var(--s-6);}
+.dqa-model-card{background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--r-xl);padding:var(--s-4);display:flex;flex-direction:column;gap:var(--s-3);box-shadow:var(--shadow-sm);}
+.dqa-model-row{display:flex;align-items:flex-start;justify-content:space-between;gap:var(--s-2);}
+.dqa-model-name{font-size:var(--text-base);font-weight:600;}
+.dqa-model-detail{font-size:var(--text-caption);color:var(--text-tertiary);margin-top:2px;line-height:1.4;}
+.dqa-progress{height:4px;background:var(--bg-subtle);border-radius:2px;overflow:hidden;display:none;}
+.dqa-progress-fill{height:100%;background:var(--accent);border-radius:2px;transition:width .3s;}
+.dqa-alert{font-size:var(--text-caption);line-height:1.5;border-radius:var(--r-lg);padding:var(--s-2) var(--s-3);}
+.dqa-alert.warn{background:var(--warning-bg);color:var(--warning);}
+.dqa-alert.info{background:var(--info-bg);color:var(--info);}
+.dqa-kb-actions{display:flex;gap:var(--s-2);flex-wrap:wrap;}
+
+/* ============================================================ MODEL PICKER */
+.dqa-mp-card{background:var(--bg-surface);border:1.5px solid var(--border-subtle);border-radius:var(--r-xl);padding:var(--s-3) var(--s-4);margin-bottom:var(--s-2);display:flex;flex-direction:column;gap:var(--s-2);box-shadow:var(--shadow-sm);transition:border-color var(--dur-fast);}
+.dqa-mp-card.selected{border-color:var(--accent);background:var(--accent-subtle);}
+.dqa-mp-card.incompatible{opacity:.5;}
+.dqa-mp-head{display:flex;align-items:flex-start;justify-content:space-between;gap:var(--s-2);}
+.dqa-mp-name{font-size:var(--text-sm);font-weight:600;}
+.dqa-mp-size{font-size:var(--text-caption);color:var(--text-tertiary);margin-top:1px;}
+.dqa-mp-tier{font-size:var(--text-caption);font-weight:600;padding:2px 8px;border-radius:var(--r-full);flex-shrink:0;}
+.dqa-mp-tier.best{background:var(--success-bg);color:var(--success);}
+.dqa-mp-tier.balanced{background:var(--info-bg);color:var(--info);}
+.dqa-mp-tier.light{background:var(--bg-subtle);color:var(--text-tertiary);}
+.dqa-mp-pros{font-size:var(--text-caption);line-height:1.5;}
+.dqa-mp-pros .pro{color:var(--success);}
+.dqa-mp-pros .con{color:var(--text-quaternary);}
+.dqa-mp-incompat-reason{font-size:var(--text-caption);color:var(--danger);font-weight:500;}
+.dqa-mp-actions{display:flex;align-items:center;gap:var(--s-2);}
+.dqa-mp-progress{height:4px;background:var(--bg-subtle);border-radius:2px;overflow:hidden;flex:1;display:none;}
+.dqa-mp-progress-fill{height:100%;background:var(--accent);border-radius:2px;transition:width .3s;}
+
+/* ============================================================ CURATOR */
+.dqa-curator-scroll{padding:var(--s-4);display:flex;flex-direction:column;gap:var(--s-5);}
+.dqa-curator-section-title{font-size:var(--text-base);font-weight:600;margin-bottom:var(--s-2);}
+.dqa-flagged-card{background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:var(--r-xl);padding:var(--s-4);display:flex;flex-direction:column;gap:var(--s-3);box-shadow:var(--shadow-sm);}
+.dqa-flagged-query{font-size:var(--text-sm);font-weight:500;color:var(--text-primary);}
+.dqa-flagged-bad{font-size:var(--text-caption);color:var(--text-tertiary);line-height:1.45;background:var(--danger-bg);border-radius:var(--r-lg);padding:var(--s-2) var(--s-3);cursor:pointer;}
+.dqa-flagged-bad summary{font-weight:600;color:var(--danger);list-style:none;}
+.dqa-curator-textarea{width:100%;resize:vertical;min-height:120px;border:1px solid var(--border-default);border-radius:var(--r-lg);padding:var(--s-3);background:var(--bg-app);color:var(--text-primary);font-size:var(--text-sm);line-height:1.5;outline:none;font-family:var(--font-ui);}
+.dqa-curator-textarea:focus{border-color:var(--accent);}
+.dqa-curator-textarea::placeholder{color:var(--text-quaternary);}
+.dqa-golden-card{background:var(--bg-surface);border:1px solid var(--accent-muted);border-radius:var(--r-xl);padding:var(--s-4);display:flex;flex-direction:column;gap:var(--s-2);box-shadow:var(--shadow-sm);}
+.dqa-golden-query{font-size:var(--text-caption);font-weight:600;color:var(--accent);}
+.dqa-golden-answer{font-size:var(--text-sm);color:var(--text-secondary);line-height:1.5;white-space:pre-wrap;}
+.dqa-golden-actions{display:flex;gap:var(--s-2);flex-wrap:wrap;margin-top:var(--s-1);}
+.dqa-golden-meta{font-size:var(--text-caption);color:var(--text-quaternary);}
+.dqa-threshold-row{display:flex;align-items:center;gap:var(--s-3);}
+.dqa-threshold-row input[type=range]{flex:1;accent-color:var(--accent);}
+.dqa-threshold-val{font-size:var(--text-sm);font-weight:600;color:var(--accent);min-width:36px;text-align:right;}
+.dqa-empty-curator{font-size:var(--text-sm);color:var(--text-tertiary);text-align:center;padding:var(--s-5) 0;line-height:1.6;}
+
+/* ============================================================ BUTTONS */
+.dqa-btn{display:inline-flex;align-items:center;gap:var(--s-1);padding:8px var(--s-4);border-radius:var(--r-lg);font-size:var(--text-sm);font-weight:500;border:none;transition:background var(--dur-fast);white-space:nowrap;}
+.dqa-btn-sm{padding:6px var(--s-3);font-size:var(--text-caption);}
+.dqa-btn-primary{background:var(--accent);color:var(--text-on-accent);}
+.dqa-btn-primary:hover:not(:disabled){background:var(--accent-hover);}
+.dqa-btn-secondary{background:var(--bg-subtle);color:var(--text-primary);border:1px solid var(--border-default);}
+.dqa-btn-secondary:hover:not(:disabled){background:var(--bg-hover);}
+.dqa-btn-danger{background:var(--danger-bg);color:var(--danger);}
+.dqa-btn:disabled{opacity:.4;cursor:default;}
+</style>
+</head>
+<body>
+<div class="dqa-app">
+
+  <div class="dqa-header">
+    <div class="dqa-header-left">
+      <div class="dqa-header-icon">📋</div>
+      <div>
+        <div class="dqa-header-title">DocQA</div>
+        <div class="dqa-header-sub" id="dqa-hdr-sub">No documents indexed</div>
+      </div>
+    </div>
+    <div class="dqa-status-pill" id="dqa-status-pill">
+      <span class="dqa-status-dot" id="dqa-status-dot"></span>
+      <span id="dqa-status-text">OFFLINE</span>
+    </div>
+  </div>
+
+  <div class="dqa-tabs">
+    <button class="dqa-tab active" data-tab="chat">Chat</button>
+    <button class="dqa-tab" data-tab="docs">Documents</button>
+    <button class="dqa-tab" data-tab="models">Models</button>
+    <button class="dqa-tab" data-tab="curator">Curator</button>
+  </div>
+
+  <!-- CHAT -->
+  <div class="dqa-panel active" id="dqa-panel-chat">
+    <div class="dqa-banner warn" id="dqa-nodocs-warn" style="display:none">No documents indexed — add PDFs in the Documents tab</div>
+    <div class="dqa-banner info" id="dqa-nomodel-warn" style="display:none">Load the embedding model in Models to enable search</div>
+    <div class="dqa-scroll">
+      <div class="dqa-chat-thread" id="dqa-thread">
+        <div class="dqa-empty" id="dqa-empty">
+          <div class="dqa-empty-icon">🔍</div>
+          <div class="dqa-empty-title">Document Assistant</div>
+          <div class="dqa-empty-body">Ask anything about your imported documents. Answers include citations and direct quotes.</div>
+        </div>
+      </div>
+    </div>
+    <div class="dqa-input-row">
+      <textarea class="dqa-textarea" id="dqa-input" placeholder="Ask a question…" rows="1"></textarea>
+      <button class="dqa-send" id="dqa-send" disabled>
+        <svg viewBox="0 0 24 24"><path d="M2 21l21-9L2 3v7l15 2-15 2z"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <!-- DOCS -->
+  <div class="dqa-panel" id="dqa-panel-docs">
+    <div class="dqa-scroll">
+      <div class="dqa-docs-scroll">
+        <div class="dqa-section-header">
+          <span class="dqa-section-title">Documents</span>
+          <button class="dqa-btn dqa-btn-primary dqa-btn-sm" id="dqa-import-btn">＋ Import PDF</button>
+        </div>
+        <input type="file" id="dqa-file-input" accept=".pdf" multiple style="display:none">
+        <div id="dqa-stats-row" class="dqa-stats" style="display:none">
+          <div class="dqa-stat"><div class="dqa-stat-num" id="dqa-stat-docs">0</div><div class="dqa-stat-lbl">DOCS</div></div>
+          <div class="dqa-stat"><div class="dqa-stat-num" id="dqa-stat-chunks">0</div><div class="dqa-stat-lbl">CHUNKS</div></div>
+          <div class="dqa-stat"><div class="dqa-stat-num" id="dqa-stat-kb">0KB</div><div class="dqa-stat-lbl">KB SIZE</div></div>
+        </div>
+        <div id="dqa-doc-list" class="dqa-doc-list">
+          <div class="dqa-doc-empty">No documents yet.<br>Import PDFs to build your knowledge base.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODELS -->
+  <div class="dqa-panel" id="dqa-panel-models">
+    <div class="dqa-scroll">
+      <div class="dqa-models-scroll">
+
+        <div>
+          <div class="dqa-label">Embedding Model</div>
+          <div class="dqa-model-card">
+            <div class="dqa-model-row">
+              <div>
+                <div class="dqa-model-name">all-MiniLM-L6-v2</div>
+                <div class="dqa-model-detail">~22 MB · Query embeddings · WASM · All devices</div>
+              </div>
+              <div class="dqa-chip" id="dqa-embed-chip">—</div>
+            </div>
+            <div class="dqa-progress" id="dqa-embed-prog"><div class="dqa-progress-fill" id="dqa-embed-fill" style="width:0%"></div></div>
+            <div class="dqa-alert info">Required for search. Downloads once, cached in browser.</div>
+            <button class="dqa-btn dqa-btn-primary dqa-btn-sm" id="dqa-embed-btn">Load Embedding Model</button>
+          </div>
+        </div>
+
+        <div>
+          <div class="dqa-label">Language Model · Answer Synthesis</div>
+          <div class="dqa-alert warn" id="dqa-webgpu-warn" style="display:none;margin-bottom:8px">⚠ WebGPU unavailable. Retrieval-only mode active — top passages returned without synthesis.</div>
+          <div class="dqa-alert info" id="dqa-device-info" style="margin-bottom:8px">Detecting device capability…</div>
+          <div id="dqa-model-picker"><!-- model cards rendered by UI.renderModelPicker --></div>
+        </div>
+
+        <div>
+          <div class="dqa-label">Knowledge Base</div>
+          <div class="dqa-model-card">
+            <div class="dqa-model-row">
+              <div>
+                <div class="dqa-model-name">KB Package</div>
+                <div class="dqa-model-detail" id="dqa-kb-detail">No package loaded</div>
+              </div>
+            </div>
+            <div class="dqa-alert info">Export to share across devices or send to curator. Import replaces current index.</div>
+            <div class="dqa-kb-actions">
+              <button class="dqa-btn dqa-btn-secondary dqa-btn-sm" id="dqa-kb-export">⬆ Export KB</button>
+              <button class="dqa-btn dqa-btn-secondary dqa-btn-sm" id="dqa-kb-import">⬇ Import KB</button>
+              <button class="dqa-btn dqa-btn-danger dqa-btn-sm" id="dqa-kb-clear">✕ Clear All</button>
+            </div>
+            <input type="file" id="dqa-kb-file" accept=".json" style="display:none">
+          </div>
+        </div>
+
+        <div>
+          <div class="dqa-label">Feedback</div>
+          <div class="dqa-model-card">
+            <div class="dqa-model-row">
+              <div>
+                <div class="dqa-model-name">Usage Feedback</div>
+                <div class="dqa-model-detail" id="dqa-fb-detail">No feedback logged yet</div>
+              </div>
+            </div>
+            <div class="dqa-alert info">Thumbs up/down on answers logs query + retrieved sources. No document text included. Export and share with curator to improve future KB versions.</div>
+            <div class="dqa-kb-actions">
+              <button class="dqa-btn dqa-btn-secondary dqa-btn-sm" id="dqa-fb-export">⬆ Export Feedback</button>
+              <button class="dqa-btn dqa-btn-danger dqa-btn-sm" id="dqa-fb-clear">✕ Clear Feedback</button>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+  <!-- ── CURATOR PANEL ── -->
+  <div class="dqa-panel" id="dqa-panel-curator">
+    <div class="dqa-scroll">
+      <div class="dqa-curator-scroll">
+
+        <!-- Similarity threshold -->
+        <div>
+          <div class="dqa-label">Match Sensitivity</div>
+          <div class="dqa-model-card">
+            <div class="dqa-model-detail">How similar a query must be to trigger a golden pair injection</div>
+            <div class="dqa-threshold-row">
+              <input type="range" id="dqa-threshold-slider" min="0.6" max="0.99" step="0.01" value="0.82">
+              <span class="dqa-threshold-val" id="dqa-threshold-val">0.82</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Flagged queries -->
+        <div>
+          <div class="dqa-curator-section-title">👎 Flagged Queries</div>
+          <div id="dqa-flagged-list">
+            <div class="dqa-empty-curator">No flagged queries yet.<br>Rate answers 👎 in Chat to see them here.</div>
+          </div>
+        </div>
+
+        <!-- Pending user suggestions -->
+        <div>
+          <div class="dqa-curator-section-title">⏳ Pending Review <span id="dqa-pending-count" style="font-weight:400;color:var(--text-tertiary);font-size:var(--text-sm)"></span></div>
+          <div id="dqa-pending-list">
+            <div class="dqa-empty-curator">No user suggestions pending.</div>
+          </div>
+        </div>
+
+        <!-- Golden pairs -->
+        <div>
+          <div class="dqa-curator-section-title">⭐ Golden Pairs <span id="dqa-golden-count" style="font-weight:400;color:var(--text-tertiary);font-size:var(--text-sm)"></span></div>
+          <div id="dqa-golden-list">
+            <div class="dqa-empty-curator">No golden pairs saved yet.<br>Write correct answers for flagged queries above.</div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- CONTEXT BOTTOM SHEET -->
+<div class="dqa-sheet-backdrop" id="dqa-backdrop" onclick="window._DQA.closeSheet()"></div>
+<div class="dqa-sheet" id="dqa-sheet">
+  <div class="dqa-sheet-handle"></div>
+  <div class="dqa-sheet-header">
+    <div>
+      <div class="dqa-sheet-title" id="dqa-sheet-title">Source</div>
+      <div class="dqa-sheet-sub" id="dqa-sheet-sub"></div>
+    </div>
+    <button class="dqa-sheet-close" onclick="window._DQA.closeSheet()">✕</button>
+  </div>
+  <div class="dqa-sheet-scroll" id="dqa-sheet-body"></div>
+</div>
+
+<script>
+if(window.pdfjsLib)
+  pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+</script>
+
+<script type="module">
+// ================================================================
+// CFG
+// ================================================================
+const CFG = {
+  CHUNK_WORDS:       200,
+  CHUNK_OVERLAP:     50,
+  INGEST_BATCH:      20,
+  TOP_K:             12,    // ↑ from 6 — more passages = better coverage
+  MAX_TOKENS:        1200,  // ↑ from 700 — allow fuller answers
+  GOLDEN_THRESHOLD:  0.82,  // cosine similarity to trigger golden pair injection
+  EMBED_MODEL:       'Xenova/all-MiniLM-L6-v2',
+  LLM_MODEL:         'Llama-3.2-1B-Instruct-q4f32_1-MLC', // overridden by saved picker choice
+  DB_NAME:           'dqa_v1',
+  DB_VER:            4,     // v4: added golden pairs store
+  KB_SCHEMA_VER:     '1',
+  MODEL_PREF_KEY:    'dqa.model',   // localStorage key for picker selection
+};
+
+// ================================================================
+// MODELCAT — selectable LLM catalog
+// All q4f32 (no shader-f16 requirement) for cross-platform safety.
+// maxTier gates compatibility against detected device tier:
+//   'universal' — runs on any WebGPU device incl. limited mobile
+//   'standard'  — needs a mid/high device (flagship phone, tablet, desktop)
+//   'desktop'   — desktop-class GPU / M-series Mac only
+// ================================================================
+const MODELCAT = [
+  {
+    id:   'Llama-3.2-1B-Instruct-q4f32_1-MLC',
+    name: 'Llama 3.2 · 1B', dl:'~700 MB', maxTier:'universal', tier:'light',
+    pros: 'Fastest · smallest download · runs on any WebGPU device',
+    cons: 'Basic synthesis — may miss nuance on complex multi-source questions',
+  },
+  {
+    id:   'SmolLM2-1.7B-Instruct-q4f32_1-MLC',
+    name: 'SmolLM2 · 1.7B', dl:'~1.0 GB', maxTier:'universal', tier:'light',
+    pros: 'Quick responses · efficient · good for simple lookups',
+    cons: 'Similar limits to 1B on complex synthesis',
+  },
+  {
+    id:   'Llama-3.2-3B-Instruct-q4f32_1-MLC',
+    name: 'Llama 3.2 · 3B', dl:'~1.7 GB', maxTier:'universal', tier:'balanced',
+    pros: 'Solid multi-source synthesis · good speed · works on most modern phones',
+    cons: 'Larger download · slower than 1B on older devices',
+  },
+  {
+    id:   'Hermes-3-Llama-3.2-3B-q4f32_1-MLC',
+    name: 'Hermes 3 · 3B', dl:'~1.7 GB', maxTier:'universal', tier:'balanced',
+    pros: 'Tuned for following structured formats — best citation reliability at this size',
+    cons: 'Same hardware needs as Llama 3B',
+  },
+  {
+    id:   'Phi-3.5-mini-instruct-q4f32_1-MLC',
+    name: 'Phi 3.5 Mini · 3.8B', dl:'~2.2 GB', maxTier:'standard', tier:'best',
+    pros: 'Strong reasoning on regulatory text · excellent instruction following',
+    cons: 'Needs flagship phone or desktop · big download',
+  },
+  {
+    id:   'Mistral-7B-Instruct-v0.3-q4f32_1-MLC',
+    name: 'Mistral · 7B', dl:'~4.0 GB', maxTier:'desktop', tier:'best',
+    pros: 'Near-desktop quality synthesis · handles dense multi-document context',
+    cons: 'Desktop / M-series Mac only · long first download',
+  },
+  {
+    id:   'Llama-3.1-8B-Instruct-q4f32_1-MLC',
+    name: 'Llama 3.1 · 8B', dl:'~4.6 GB', maxTier:'desktop', tier:'best',
+    pros: 'Best available quality — thorough answers, best edge-case coverage',
+    cons: 'Desktop-class GPU required · largest download',
+  },
+];
+
+// ================================================================
+// ST — runtime state
+// ================================================================
+const ST = {
+  docs: [], chunks: [],
+  embedder:null, llm:null,
+  llmReady:false, embedReady:false, webgpuOk:false, busy:false,
+};
+
+// ================================================================
+// DB — IndexedDB (docs · chunks · feedback)
+// ================================================================
+const DB = (() => {
+  let _db = null;
+
+  const open = () => new Promise((res,rej) => {
+    const req = indexedDB.open(CFG.DB_NAME, CFG.DB_VER);
+    req.onupgradeneeded = e => {
+      const db = e.target.result;
+      ['docs','chunks','feedback','pdfs','golden'].forEach(s => {
+        if (!db.objectStoreNames.contains(s))
+          db.createObjectStore(s, {keyPath:'id'});
+      });
+    };
+    req.onsuccess = e => { _db=e.target.result; res(); };
+    req.onerror   = () => rej(req.error);
+  });
+
+  const _tx = (stores,mode,fn) => new Promise((res,rej) => {
+    const t=_db.transaction(stores,mode);
+    t.oncomplete=res; t.onerror=()=>rej(t.error); fn(t);
+  });
+
+  const getAll = store => new Promise((res,rej) => {
+    const r=_db.transaction(store,'readonly').objectStore(store).getAll();
+    r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error);
+  });
+
+  const putAll = (store,items) => _tx(store,'readwrite',t=>{
+    const s=t.objectStore(store); items.forEach(i=>s.put(i));
+  });
+
+  const put = (store,item) => putAll(store,[item]);
+
+  const clearAll = () => _tx(['docs','chunks','pdfs'],'readwrite',t=>{
+    t.objectStore('docs').clear();
+    t.objectStore('chunks').clear();
+    t.objectStore('pdfs').clear();
+  });
+
+  const deleteDoc = docId => _tx(['docs','chunks','pdfs'],'readwrite',t=>{
+    t.objectStore('docs').delete(docId);
+    t.objectStore('pdfs').delete(docId);
+    const s=t.objectStore('chunks');
+    const req=s.openCursor();
+    req.onsuccess=e=>{
+      const cur=e.target.result; if(!cur)return;
+      if(cur.value.docId===docId) cur.delete();
+      cur.continue();
+    };
+  });
+
+  const getPdf = docId => new Promise((res,rej) => {
+    const r=_db.transaction('pdfs','readonly').objectStore('pdfs').get(docId);
+    r.onsuccess=()=>res(r.result?.data??null);
+    r.onerror=()=>rej(r.error);
+  });
+
+  const clearFeedback = () => _tx('feedback','readwrite',t=>t.objectStore('feedback').clear());
+
+  const putGolden  = item  => put('golden', item);
+  const getGolden  = ()    => getAll('golden');
+  const delGolden  = id    => _tx('golden','readwrite',t=>t.objectStore('golden').delete(id));
+
+  return {open,getAll,putAll,put,clearAll,deleteDoc,clearFeedback,getPdf,putGolden,getGolden,delGolden};
+})();
+
+// ================================================================
+// EMBED — transformers.js WASM (universal, no WebGPU)
+// ================================================================
+const EMBED = {
+  async load(onProgress) {
+    const {pipeline,env} = await import(
+      'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2/dist/transformers.min.js'
+    );
+    env.allowLocalModels = false;
+    ST.embedder = await pipeline('feature-extraction', CFG.EMBED_MODEL, {
+      progress_callback: p => { if(p.status==='progress'&&onProgress) onProgress(Math.round(p.progress??0)); }
+    });
+    ST.embedReady = true;
+  },
+
+  async embed(text) {
+    const out = await ST.embedder(text,{pooling:'mean',normalize:true});
+    return Array.from(out.data);
+  }
+};
+
+// ================================================================
+// INGEST — PDF → chunks → progressive embedding + save
+// onProgress(msg, pct, done, total)
+// ================================================================
+const INGEST = {
+  async extractPages(buf) {
+    const pdf = await pdfjsLib.getDocument({data: buf.slice(0)}).promise;
+    const pages = [];
+    for(let p=1;p<=pdf.numPages;p++){
+      const pg=await pdf.getPage(p);
+      const ct=await pg.getTextContent();
+      pages.push(ct.items.map(i=>i.str).join(' '));
+    }
+    return pages;
+  },
+
+  chunkPages(pages,docId,docName) {
+    const words=[],pageMap=[];
+    pages.forEach((text,pi)=>text.split(/\s+/).filter(Boolean).forEach(w=>{words.push(w);pageMap.push(pi+1);}));
+    const chunks=[];
+    let i=0,idx=0;
+    while(i<words.length){
+      const end=Math.min(i+CFG.CHUNK_WORDS,words.length);
+      chunks.push({id:`${docId}_${idx}`,docId,docName,page:pageMap[i],text:words.slice(i,end).join(' '),embedding:null});
+      idx++; i+=CFG.CHUNK_WORDS-CFG.CHUNK_OVERLAP;
+      if(i>=words.length) break;
+    }
+    return chunks;
+  },
+
+  async processFile(file,onProgress) {
+    const docId   = `doc_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
+    const docName = file.name.replace(/\.pdf$/i,'');
+
+    onProgress('Extracting text…',2,0,0);
+    // Read once — reuse for both text extraction and PDF storage
+    const buf = await file.arrayBuffer();
+    const pages = await this.extractPages(buf);
+
+    onProgress('Chunking…',8,0,0);
+    const chunks = this.chunkPages(pages,docId,docName);
+    const total  = chunks.length;
+
+    // Save PDF binary for page rendering (stored separately from chunks)
+    await DB.put('pdfs', {id:docId, data:buf});
+
+    // Persist doc record immediately — status:'indexing' enables resume detection
+    const doc = {id:docId,name:docName,pages:pages.length,chunkCount:total,
+                 chunksIndexed:0,size:file.size,imported:Date.now(),status:'indexing'};
+    await DB.putAll('docs',[doc]);
+    await DB.putAll('chunks',chunks);
+    ST.docs.push(doc);
+
+    let batchStart=0;
+    for(let i=0;i<total;i++){
+      chunks[i].embedding = await EMBED.embed(chunks[i].text);
+      const flush = (i+1)%CFG.INGEST_BATCH===0 || i===total-1;
+      if(flush){
+        await DB.putAll('chunks',chunks.slice(batchStart,i+1));
+        doc.chunksIndexed=i+1;
+        await DB.put('docs',doc);
+        batchStart=i+1;
+      }
+      onProgress('Embedding…',10+Math.round((i+1)/total*85),i+1,total);
+    }
+
+    doc.status='indexed';
+    await DB.put('docs',doc);
+    ST.chunks.push(...chunks);
+    onProgress('Done',100,total,total);
+    return doc;
+  },
+
+  // Re-embed only the null-embedding chunks for an interrupted doc
+  async resumeDoc(doc,onProgress) {
+    const allChunks = await DB.getAll('chunks');
+    const docChunks = allChunks.filter(c=>c.docId===doc.id);
+    const pending   = docChunks.filter(c=>c.embedding===null);
+    const total     = docChunks.length;
+    let done        = total-pending.length;
+
+    onProgress('Resuming…',Math.round(done/total*90),done,total);
+
+    let batchStart=0;
+    for(let i=0;i<pending.length;i++){
+      pending[i].embedding = await EMBED.embed(pending[i].text);
+      const flush = (i+1)%CFG.INGEST_BATCH===0 || i===pending.length-1;
+      if(flush){
+        await DB.putAll('chunks',pending.slice(batchStart,i+1));
+        done=(total-pending.length)+i+1;
+        doc.chunksIndexed=done;
+        await DB.put('docs',doc);
+        batchStart=i+1;
+      }
+      onProgress('Resuming…',Math.round(done/total*90),done,total);
+    }
+
+    doc.status='indexed';
+    await DB.put('docs',doc);
+    // Merge embedded chunks back into ST.chunks
+    const embeddedMap = Object.fromEntries(pending.map(c=>[c.id,c]));
+    ST.chunks = ST.chunks.filter(c=>c.docId!==doc.id);
+    ST.chunks.push(...docChunks.map(c=>embeddedMap[c.id]??c));
+    onProgress('Done',100,total,total);
+    return doc;
+  }
+};
+
+// ================================================================
+// SEARCH — cosine similarity in a Web Worker (off main thread)
+// ================================================================
+const SEARCH = (() => {
+  // Worker source as string — runs cosine math off the UI thread
+  const SRC = `
+    self.onmessage = function(e) {
+      const {chunks, qvec, k} = e.data;
+      function cosine(a,b){
+        let dot=0,na=0,nb=0;
+        for(let i=0;i<a.length;i++){dot+=a[i]*b[i];na+=a[i]*a[i];nb+=b[i]*b[i];}
+        return dot/(Math.sqrt(na)*Math.sqrt(nb)+1e-10);
+      }
+      const ids = chunks
+        .map(c=>({id:c.id, s:cosine(qvec,c.embedding)}))
+        .sort((a,b)=>b.s-a.s)
+        .slice(0,k)
+        .map(x=>x.id);
+      self.postMessage(ids);
+    };
+  `;
+  let _worker = null;
+  const getWorker = () => {
+    if (!_worker) {
+      const blob = new Blob([SRC], {type:'text/javascript'});
+      _worker = new Worker(URL.createObjectURL(blob));
+    }
+    return _worker;
+  };
+
+  return {
+    async retrieve(queryText, k=CFG.TOP_K) {
+      const qvec    = await EMBED.embed(queryText);
+      const indexed = ST.chunks.filter(c=>c.embedding!==null);
+
+      // Send only id+embedding to worker
+      const ids = await new Promise((res,rej) => {
+        const w = getWorker();
+        w.onmessage = e => res(e.data);
+        w.onerror   = e => rej(new Error(e.message));
+        w.postMessage({ chunks: indexed.map(c=>({id:c.id, embedding:c.embedding})), qvec, k });
+      });
+
+      const retrieved = ids.map(id => ST.chunks.find(c=>c.id===id)).filter(Boolean);
+
+      // Inject curator/approved golden pair if query matches threshold
+      const match = GOLDEN.findInjectMatch(qvec);
+      if (match) {
+        return [GOLDEN.asSyntheticChunk(match.pair), ...retrieved];
+      }
+
+      // No injectable match — check pending pairs for retrieval boosting.
+      // Pending pairs inform which topic area we're in but don't appear in answers.
+      // (Boost is implicit: pending pairs expand the effective query signal;
+      //  future versions can re-rank retrieved chunks using pending answer embeddings.)
+      return retrieved;
+    }
+  };
+})();
+
+// ================================================================
+// GOLDEN — tiered authority Q&A pairs
+// authority: 'curator' | 'approved' | 'pending'
+//   curator  — injected as [VERIFIED ANSWER]
+//   approved — injected as [COMMUNITY ANSWER]
+//   pending  — NOT injected; used only to boost retrieval scores
+// ================================================================
+const GOLDEN = {
+  _pairs: [],
+
+  async load() { this._pairs = await DB.getGolden(); },
+
+  async add(query, answer, authority='curator', sourceFeedbackId=null) {
+    const embedding = await EMBED.embed(query);
+    const pair = {
+      id: `gp_${Date.now()}_${Math.random().toString(36).slice(2,5)}`,
+      created: Date.now(),
+      query, answer, authority,
+      queryEmbedding: embedding,
+      sourceFeedbackId,
+    };
+    await DB.putGolden(pair);
+    this._pairs.push(pair);
+    return pair;
+  },
+
+  async update(id, fields) {
+    const pair = this._pairs.find(p=>p.id===id);
+    if (!pair) return;
+    Object.assign(pair, fields);
+    // Re-embed if query changed
+    if (fields.query) pair.queryEmbedding = await EMBED.embed(fields.query);
+    await DB.putGolden(pair);
+  },
+
+  async remove(id) {
+    await DB.delGolden(id);
+    this._pairs = this._pairs.filter(p=>p.id!==id);
+  },
+
+  _cosine(a, b) {
+    let dot=0,na=0,nb=0;
+    for(let i=0;i<a.length;i++){dot+=a[i]*b[i];na+=a[i]*a[i];nb+=b[i]*b[i];}
+    return dot/(Math.sqrt(na)*Math.sqrt(nb)+1e-10);
+  },
+
+  // Find best injectable match (curator or approved only).
+  // Returns {pair, score} or null.
+  findInjectMatch(qvec) {
+    const injectable = this._pairs.filter(p=>p.authority==='curator'||p.authority==='approved');
+    if (!injectable.length) return null;
+    let best=null, bestScore=-1;
+    for (const p of injectable) {
+      if (!p.queryEmbedding) continue;
+      const s = this._cosine(qvec, p.queryEmbedding);
+      if (s > bestScore) { bestScore=s; best=p; }
+    }
+    return bestScore >= CFG.GOLDEN_THRESHOLD ? {pair:best, score:bestScore} : null;
+  },
+
+  // Get pending pairs that are semantically near the query.
+  // Used to boost retrieval — not injected into answers.
+  getPendingBoosts(qvec, threshold=0.65) {
+    return this._pairs
+      .filter(p=>p.authority==='pending'&&p.queryEmbedding)
+      .filter(p=>this._cosine(qvec,p.queryEmbedding)>=threshold);
+  },
+
+  asSyntheticChunk(pair) {
+    const isCurator = pair.authority==='curator';
+    return {
+      id:       'golden_'+pair.id,
+      docName:  isCurator ? '⭐ Verified Answer' : '👥 Community Answer',
+      page:     '—',
+      text:     pair.answer,
+      isGolden: true,
+      authority: pair.authority,
+    };
+  }
+};
+// ================================================================
+// LLM — WebLLM Llama on main thread (WebGPU async, cache-safe)
+// Note: blob workers have null origin and can't access Cache API,
+// causing re-downloads every session. Main thread preserves cache.
+// GPU inference is async so main thread remains responsive during generation.
+// ================================================================
+const LLM = {
+  device: { webgpu:false, maxBuf:0, tier:'none', label:'No WebGPU' },
+
+  // Probe WebGPU adapter. Note: maxBufferSize is the largest SINGLE buffer
+  // a browser exposes — often a conservative spec default (e.g. 2GB on mobile
+  // Chrome) that does NOT reflect true GPU memory. We use it only to gate the
+  // very largest models, and lean permissive: most modern phones run 3B fine
+  // even when reporting a 2GB max-buffer limit.
+  async detectDevice(){
+    try{
+      const adapter = await navigator.gpu?.requestAdapter();
+      if(!adapter){ this.device={webgpu:false,maxBuf:0,tier:'none',label:'No WebGPU'}; return this.device; }
+      const maxBuf = adapter.limits?.maxBufferSize ?? 0;
+      const maxStorage = adapter.limits?.maxStorageBufferBindingSize ?? 0;
+      const mb = Math.round(maxBuf/1048576);
+      // Effective capacity: take the larger of the two reported limits — some
+      // browsers report a low maxBufferSize but a higher storage binding size.
+      const effMb = Math.round(Math.max(maxBuf, maxStorage)/1048576);
+      let tier, label;
+      if      (effMb >= 4000) { tier='high'; label=`Capable GPU detected`; }
+      else if (effMb >= 1800) { tier='mid';  label=`Standard GPU detected`; }
+      else                    { tier='low';  label=`Limited GPU detected`; }
+      this.device = { webgpu:true, maxBuf:mb, effMb, tier, label };
+    }catch{ this.device={webgpu:false,maxBuf:0,effMb:0,tier:'none',label:'No WebGPU'}; }
+    return this.device;
+  },
+
+  // Compatibility uses a model's KNOWN working tier rather than raw VRAM math,
+  // since maxBufferSize underreports on mobile. Maps device tier → allowed models.
+  isCompatible(model){
+    if(!this.device.webgpu) return false;
+    const t = this.device.tier;
+    if(t==='high') return true;                    // run anything
+    if(t==='mid')  return model.maxTier!=='desktop'; // up through Phi/Mistral-light
+    if(t==='low')  return model.maxTier==='universal'; // 1B / SmolLM / 3B
+    return false;
+  },
+
+  // Pick best compatible default: largest 'balanced' that fits, else largest light.
+  autoDefault(){
+    const fits = MODELCAT.filter(m=>this.isCompatible(m));
+    if(!fits.length) return null;
+    const balanced = fits.filter(m=>m.tier==='balanced');
+    if(balanced.length) return balanced[balanced.length-1].id;
+    const light = fits.filter(m=>m.tier==='light');
+    if(light.length) return light[light.length-1].id;
+    return fits[fits.length-1].id;
+  },
+
+  currentModel(){
+    const saved = localStorage.getItem(CFG.MODEL_PREF_KEY);
+    const m = MODELCAT.find(x=>x.id===saved);
+    if(m && this.isCompatible(m)) return m.id;
+    return this.autoDefault();
+  },
+
+  async checkWebGPU(){
+    try{return !!(await navigator.gpu?.requestAdapter());}catch{return false;}
+  },
+
+  async load(onProgress){
+    // esm.run is WebLLM's recommended CDN; esm.sh can't bundle WASM dependencies
+    const webllm = await import('https://esm.run/@mlc-ai/web-llm');
+    ST.llm = await webllm.CreateMLCEngine(CFG.LLM_MODEL, {
+      initProgressCallback: p => onProgress(Math.round((p.progress??0)*100))
+    });
+    ST.llmReady = true;
+  },
+
+  buildMessages(query,chunks){
+    const curatorChunk   = chunks.find(c=>c.isGolden&&c.authority==='curator');
+    const communityChunk = chunks.find(c=>c.isGolden&&c.authority==='approved');
+    const passages = chunks.map((c,i)=>{
+      let label;
+      if (c.isGolden && c.authority==='curator')  label='[VERIFIED ANSWER]';
+      else if (c.isGolden && c.authority==='approved') label='[COMMUNITY ANSWER]';
+      else label=`[${i+1}]`;
+      return `${label} ${c.docName}${c.page!=='—'?' — Page '+c.page:''}\n${c.text}`;
+    }).join('\n\n---\n\n');
+
+    const goldenNote = curatorChunk
+      ? 'The passage marked [VERIFIED ANSWER] is an expert-authored answer — treat it as the primary authoritative source and synthesize the other passages around it.'
+      : communityChunk
+      ? 'The passage marked [COMMUNITY ANSWER] has been reviewed and approved — use it as helpful context but verify against the other source passages.'
+      : '';
+
+    return [
+      {role:'system', content:
+        'You are an aviation reference assistant with deep knowledge of FARs, airline contracts, and operational procedures. ' +
+        goldenNote +
+        ' Answer using ONLY the source passages provided. ' +
+        'Provide a thorough, complete answer covering all relevant aspects and edge cases found in the passages — do not truncate or oversimplify. ' +
+        'If passages contain partial or related information, include it even if not a direct answer. ' +
+        'After your answer, list each source cited with a short direct quote (under 20 words). ' +
+        'If passages do not fully answer the question, explicitly state what is missing. ' +
+        'Format:\nAnswer: [full answer]\n\nCitations:\n• [Source — Page N] — "direct quote"'},
+      {role:'user', content:`SOURCE PASSAGES:\n\n${passages}\n\nQUESTION: ${query}`}
+    ];
+  },
+
+  async synthesize(query,chunks){
+    try{
+      return await this._call(query,chunks);
+    }catch(err){
+      try{
+        UI.setThinkLabel('Model reloading…');
+        const webllm = await import('https://esm.run/@mlc-ai/web-llm');
+        ST.llm = await webllm.CreateMLCEngine(CFG.LLM_MODEL);
+        return await this._call(query,chunks);
+      }catch(retryErr){ throw retryErr; }
+    }
+  },
+
+  async _call(query,chunks){
+    const resp = await ST.llm.chat.completions.create({
+      messages:this.buildMessages(query,chunks),temperature:0.1,max_tokens:CFG.MAX_TOKENS
+    });
+    return resp.choices[0].message.content;
+  }
+};
+
+// ================================================================
+// CONTEXT — PDF page renderer with surrounding-chunk fallback
+// ================================================================
+const CONTEXT = {
+  chunkIdx(id)  { return parseInt(id.split('_').pop(), 10); },
+  chunkBase(id) { return id.slice(0, id.lastIndexOf('_')); },
+
+  async open(chunkId) {
+    const chunk = ST.chunks.find(c=>c.id===chunkId);
+    if (!chunk) return;
+
+    document.getElementById('dqa-sheet-title').textContent = chunk.docName;
+    document.getElementById('dqa-sheet-sub').textContent   = `Page ${chunk.page}`;
+    document.getElementById('dqa-sheet-body').innerHTML    =
+      `<div style="text-align:center;padding:32px;color:var(--text-tertiary);font-size:13px">Loading page…</div>`;
+
+    document.getElementById('dqa-backdrop').classList.add('open');
+    document.getElementById('dqa-sheet').classList.add('open');
+    document.body.style.overflow = 'hidden';
+
+    // Try PDF page render first; fall back to surrounding chunks if no PDF stored
+    const pdfBuf = await DB.getPdf(chunk.docId).catch(()=>null);
+    if (pdfBuf) {
+      await this._renderPage(pdfBuf, chunk);
+    } else {
+      this._renderChunks(chunk);
+    }
+  },
+
+  async _renderPage(buf, chunk) {
+    try {
+      const pdf  = await pdfjsLib.getDocument({data: buf.slice(0)}).promise;
+      const page = await pdf.getPage(chunk.page);
+
+      // Scale to fit sheet width (max ~760px, device-pixel-ratio aware)
+      const sheetW   = Math.min(window.innerWidth, 800) - 32;
+      const viewport = page.getViewport({scale: 1});
+      const scale    = (sheetW / viewport.width) * window.devicePixelRatio;
+      const vp       = page.getViewport({scale});
+
+      const canvas  = document.createElement('canvas');
+      canvas.width  = vp.width;
+      canvas.height = vp.height;
+      canvas.style.width  = (vp.width  / window.devicePixelRatio) + 'px';
+      canvas.style.height = (vp.height / window.devicePixelRatio) + 'px';
+      canvas.style.borderRadius = 'var(--r-lg)';
+      canvas.style.boxShadow    = 'var(--shadow-md)';
+
+      await page.render({canvasContext: canvas.getContext('2d'), viewport: vp}).promise;
+
+      // Page nav state
+      let currentPage = chunk.page;
+      const totalPages = pdf.numPages;
+
+      const wrap = document.createElement('div');
+      wrap.style.cssText = 'display:flex;flex-direction:column;gap:12px;align-items:center;padding:8px 0 16px';
+
+      const nav = document.createElement('div');
+      nav.style.cssText = 'display:flex;align-items:center;gap:12px;width:100%;justify-content:center;';
+      nav.innerHTML = `
+        <button class="dqa-btn dqa-btn-secondary dqa-btn-sm" id="dqa-pg-prev">‹ Prev</button>
+        <span style="font-size:13px;color:var(--text-tertiary)" id="dqa-pg-lbl">p.${currentPage} / ${totalPages}</span>
+        <button class="dqa-btn dqa-btn-secondary dqa-btn-sm" id="dqa-pg-next">Next ›</button>
+      `;
+
+      wrap.appendChild(nav);
+      wrap.appendChild(canvas);
+      document.getElementById('dqa-sheet-body').innerHTML = '';
+      document.getElementById('dqa-sheet-body').appendChild(wrap);
+      document.getElementById('dqa-sheet-body').scrollTop = 0;
+
+      // Page navigation
+      const goTo = async p => {
+        if (p < 1 || p > totalPages) return;
+        currentPage = p;
+        document.getElementById('dqa-pg-lbl').textContent = `p.${currentPage} / ${totalPages}`;
+        const pg2  = await pdf.getPage(currentPage);
+        const vp2  = pg2.getViewport({scale});
+        canvas.width  = vp2.width; canvas.height = vp2.height;
+        canvas.style.width  = (vp2.width  / window.devicePixelRatio)+'px';
+        canvas.style.height = (vp2.height / window.devicePixelRatio)+'px';
+        await pg2.render({canvasContext:canvas.getContext('2d'),viewport:vp2}).promise;
+      };
+
+      document.getElementById('dqa-pg-prev').onclick = () => goTo(currentPage - 1);
+      document.getElementById('dqa-pg-next').onclick = () => goTo(currentPage + 1);
+
+    } catch(err) {
+      // PDF render failed — fall back to text chunks
+      this._renderChunks(ST.chunks.find(c=>c.id===chunk.id));
+    }
+  },
+
+  _renderChunks(chunk) {
+    const base = this.chunkBase(chunk.id);
+    const idx  = this.chunkIdx(chunk.id);
+    const byIdx = i => ST.chunks.find(c=>c.id===`${base}_${i}`)??null;
+    const prev = byIdx(idx-1), next = byIdx(idx+1);
+
+    const block = (c, role) => {
+      if (!c) return '';
+      const labels = {prev:'Before',current:'Retrieved passage',next:'After'};
+      return `<div class="dqa-ctx-block ${role}">
+        <div class="dqa-ctx-label">${labels[role]}</div>
+        <div class="dqa-ctx-page">p.${c.page}</div>
+        <div class="dqa-ctx-text">${c.text}</div>
+      </div>`;
+    };
+
+    document.getElementById('dqa-sheet-body').innerHTML =
+      block(prev,'prev') +
+      (prev?'<div class="dqa-ctx-divider">↓</div>':'') +
+      block(chunk,'current') +
+      (next?'<div class="dqa-ctx-divider">↓</div>':'') +
+      block(next,'next');
+    document.getElementById('dqa-sheet-body').scrollTop = 0;
+  },
+
+  close() {
+    document.getElementById('dqa-backdrop').classList.remove('open');
+    document.getElementById('dqa-sheet').classList.remove('open');
+    document.body.style.overflow = '';
+  }
+};
+
+// ================================================================
+// FEEDBACK — query log; no document text stored
+// ================================================================
+const FEEDBACK = {
+  async log(query,chunks,answer,llmUsed){
+    const entry={
+      id:`fb_${Date.now()}_${Math.random().toString(36).slice(2,5)}`,
+      ts:Date.now(), query,
+      chunkIds:chunks.map(c=>c.id),
+      sources:chunks.map(c=>({docName:c.docName,page:c.page})),
+      answer, llmUsed, rating:null,
+    };
+    await DB.put('feedback',entry);
+    UI.refreshFeedbackDetail();
+    return entry.id;
+  },
+
+  async rate(id,rating){
+    const all=await DB.getAll('feedback');
+    const entry=all.find(f=>f.id===id);
+    if(!entry) return;
+    entry.rating=rating;
+    await DB.put('feedback',entry);
+  },
+
+  async exportJSON(){
+    const entries=await DB.getAll('feedback');
+    // Include user-authored pairs (pending + any local curator work) so the
+    // homebase curator can review and merge them. No document text included.
+    const pkg={
+      schema:'feedback-1',
+      exported:new Date().toISOString(),
+      entries,
+      golden: GOLDEN._pairs,
+    };
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(new Blob([JSON.stringify(pkg,null,2)],{type:'application/json'}));
+    a.download=`docqa-feedback-${Date.now()}.json`;
+    a.click(); URL.revokeObjectURL(a.href);
+  },
+
+  async count(){
+    const all=await DB.getAll('feedback');
+    return {total:all.length,rated:all.filter(f=>f.rating).length};
+  }
+};
+
+// ================================================================
+// KB — knowledge base export / import
+// ================================================================
+const KB = {
+  export(){
+    const pkg={schema:CFG.KB_SCHEMA_VER,exported:new Date().toISOString(),
+               docs:ST.docs,chunks:ST.chunks,golden:GOLDEN._pairs};
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(new Blob([JSON.stringify(pkg)],{type:'application/json'}));
+    a.download=`docqa-kb-${Date.now()}.json`;
+    a.click(); URL.revokeObjectURL(a.href);
+  },
+
+  async import(file){
+    const pkg=JSON.parse(await file.text());
+    if(pkg.schema!==CFG.KB_SCHEMA_VER) throw new Error(`Schema mismatch (got ${pkg.schema})`);
+    await DB.clearAll();
+    await DB.putAll('docs',pkg.docs);
+    await DB.putAll('chunks',pkg.chunks);
+    if(pkg.golden?.length) await DB.putAll('golden',pkg.golden);
+    ST.docs=pkg.docs; ST.chunks=pkg.chunks;
+    GOLDEN._pairs = pkg.golden??[];
+    return pkg;
+  }
+};
+
+// ================================================================
+// UI
+// ================================================================
+const UI = {
+
+  initTabs(){
+    document.querySelectorAll('.dqa-tab').forEach(btn=>{
+      btn.addEventListener('click',()=>{
+        document.querySelectorAll('.dqa-tab,.dqa-panel').forEach(el=>el.classList.remove('active'));
+        btn.classList.add('active');
+        document.getElementById(`dqa-panel-${btn.dataset.tab}`).classList.add('active');
+      });
+    });
+  },
+
+  setStatus(label,state){
+    document.getElementById('dqa-status-pill').className=`dqa-status-pill ${state}`;
+    document.getElementById('dqa-status-dot').className=`dqa-status-dot ${state==='loading'?'pulse':''}`;
+    document.getElementById('dqa-status-text').textContent=label;
+  },
+
+  setHeaderSub(text){document.getElementById('dqa-hdr-sub').textContent=text;},
+
+  refreshBanners(){
+    const ready=ST.chunks.filter(c=>c.embedding).length;
+    document.getElementById('dqa-nodocs-warn').style.display=ready?'none':'block';
+    document.getElementById('dqa-nomodel-warn').style.display=ST.embedReady?'none':'block';
+  },
+
+  appendMsg(role,html){
+    document.getElementById('dqa-empty')?.remove();
+    const thread=document.getElementById('dqa-thread');
+    const div=document.createElement('div');
+    div.className=`dqa-msg ${role}`; div.innerHTML=html;
+    thread.appendChild(div); thread.scrollTop=thread.scrollHeight;
+    return div;
+  },
+
+  appendThinking(){
+    return this.appendMsg('ai',
+      `<div class="dqa-bubble dqa-thinking">
+        <div class="dqa-dots"><span></span><span></span><span></span></div>
+        <span id="dqa-think-lbl">Searching…</span>
+      </div>`);
+  },
+
+  setThinkLabel(t){const el=document.getElementById('dqa-think-lbl');if(el)el.textContent=t;},
+
+  renderAnswer(rawText,chunks,llmUsed,feedbackId){
+    const modeTag=llmUsed?`✦ Llama · ${chunks.length} sources`:`⚡ Retrieval-only · ${chunks.length} sources`;
+    let summary=rawText;
+    if(rawText.includes('Answer:'))
+      summary=rawText.split('Answer:')[1].split(/Citations:|•/)[0].trim();
+    else if(rawText.includes('Summary:'))
+      summary=rawText.split('Summary:')[1].split(/Citations:|•/)[0].trim();
+    const citHtml=chunks.map(c=>`<div class="dqa-citation" onclick="window._DQA.openContext('${c.id}')" role="button" tabindex="0">
+      <div class="dqa-citation-source">📄 ${c.docName} — p.${c.page}</div>
+      <div class="dqa-citation-quote">${c.text.replace(/\s+/g,' ').slice(0,160)}…</div>
+      <div class="dqa-citation-tap">Tap to read more ›</div>
+    </div>`).join('');
+    const rateHtml=feedbackId?`
+      <div class="dqa-rating-row">
+        <span class="dqa-rate-label">Helpful?</span>
+        <button class="dqa-rate-btn up" onclick="window._DQA.rate('${feedbackId}','up',this)">👍</button>
+        <button class="dqa-rate-btn down" onclick="window._DQA.rate('${feedbackId}','down',this)">👎</button>
+      </div>
+      <div id="dqa-suggest-${feedbackId}" style="display:none;margin-top:6px">
+        <textarea class="dqa-curator-textarea" id="dqa-sug-ta-${feedbackId}"
+          placeholder="Know a better answer? Suggest it for curator review…" style="min-height:80px"></textarea>
+        <button class="dqa-btn dqa-btn-secondary dqa-btn-sm" style="margin-top:6px"
+          onclick="window._DQA.suggestAnswer('${feedbackId}')">Submit suggestion</button>
+      </div>`:'';
+    return `<div class="dqa-bubble">
+      <div class="dqa-mode-tag">${modeTag}</div>
+      <div class="dqa-summary">${summary}</div>
+      <div class="dqa-citations-label">Sources</div>
+      <div class="dqa-citations">${citHtml}</div>
+      ${rateHtml}
+    </div>`;
+  },
+
+  fallbackAnswer(chunks,feedbackId){
+    // Distinguish: no model selected vs selected-but-not-loaded-this-session
+    const sel = MODELCAT.find(m=>m.id===CFG.LLM_MODEL);
+    const msg = !ST.webgpuOk
+      ? `Found ${chunks.length} relevant passages. This device can't run answer synthesis (no WebGPU) — showing top passages.`
+      : sel
+      ? `Found ${chunks.length} relevant passages. To get a synthesized answer, open the Models tab and tap "Download & Load" on ${sel.name} — it must be loaded once per session.`
+      : `Found ${chunks.length} relevant passages. Select and load a model in the Models tab for a synthesized answer.`;
+    return this.renderAnswer(msg, chunks, false, feedbackId);
+  },
+
+  async submitQuery(){
+    const ta=document.getElementById('dqa-input');
+    const query=ta.value.trim();
+    if(!query||ST.busy||!ST.embedReady||!ST.chunks.filter(c=>c.embedding).length) return;
+    ST.busy=true; ta.value=''; ta.style.height='auto'; this.setSendEnabled(false);
+    this.appendMsg('user',`<div class="dqa-bubble">${query}</div>`);
+    const thinkEl=this.appendThinking();
+
+    // Track if the tab gets backgrounded during generation (mobile GPU teardown)
+    let wasHidden=false;
+    const visHandler=()=>{ if(document.hidden) wasHidden=true; };
+    document.addEventListener('visibilitychange',visHandler);
+
+    // Request screen wake lock so the OS is less aggressive reclaiming GPU
+    let wakeLock=null;
+    try{ if('wakeLock' in navigator) wakeLock=await navigator.wakeLock.request('screen'); }catch{}
+
+    let chunks,answerHtml;
+    try{
+      this.setThinkLabel('Searching knowledge base…');
+      chunks=await SEARCH.retrieve(query);
+      let rawAnswer,llmUsed=false;
+      if(ST.llmReady){
+        this.setThinkLabel('Synthesizing answer…');
+        rawAnswer=await LLM.synthesize(query,chunks);
+        llmUsed=true;
+      }
+      const feedbackId=await FEEDBACK.log(query,chunks,rawAnswer??'',llmUsed);
+      answerHtml=llmUsed
+        ?this.renderAnswer(rawAnswer,chunks,true,feedbackId)
+        :this.fallbackAnswer(chunks,feedbackId);
+    }catch(err){
+      const isGPU = err.message&&(err.message.includes('GPUBuffer')||
+        err.message.includes('mapAsync')||err.message.includes('GPU')||
+        err.message.includes('lost')||err.message.includes('unmapped'));
+      if(isGPU && wasHidden && chunks){
+        // Interrupted by backgrounding — retrieval succeeded, offer clean retry
+        const feedbackId=await FEEDBACK.log(query,chunks,'',false);
+        answerHtml=`<div class="dqa-bubble">
+          <div class="dqa-mode-tag">⚡ Retrieval complete · synthesis interrupted</div>
+          <div class="dqa-summary">The answer generation was interrupted because the app was minimized. The relevant passages were found successfully — tap retry to generate the full answer (keep the app open this time).</div>
+          <button class="dqa-btn dqa-btn-primary dqa-btn-sm" style="margin:8px 0"
+            onclick="window._DQA.retryQuery('${query.replace(/'/g,"\\'")}')">↻ Retry answer</button>
+          <div class="dqa-citations-label">Sources</div>
+          <div class="dqa-citations">${chunks.map(c=>`<div class="dqa-citation" onclick="window._DQA.openContext('${c.id}')">
+            <div class="dqa-citation-source">📄 ${c.docName} — p.${c.page}</div>
+            <div class="dqa-citation-quote">${c.text.replace(/\s+/g,' ').slice(0,160)}…</div>
+            <div class="dqa-citation-tap">Tap to read more ›</div>
+          </div>`).join('')}</div>
+        </div>`;
+      } else if(chunks){
+        // Other error — still show the retrieval results
+        answerHtml=this.fallbackAnswer(chunks,await FEEDBACK.log(query,chunks,'',false));
+      } else {
+        answerHtml=`<div class="dqa-bubble"><div class="dqa-summary">Error: ${err.message}</div></div>`;
+      }
+    }finally{
+      document.removeEventListener('visibilitychange',visHandler);
+      if(wakeLock){ try{ await wakeLock.release(); }catch{} }
+    }
+    thinkEl.remove();
+    this.appendMsg('ai',answerHtml);
+    ST.busy=false; this.updateSendState();
+  },
+
+  // Retry a query (used after a backgrounding interruption)
+  retryQuery(query){
+    const ta=document.getElementById('dqa-input');
+    ta.value=query;
+    this.submitQuery();
+  },
+
+  initChatInput(){
+    const ta=document.getElementById('dqa-input');
+    ta.addEventListener('input',()=>{
+      ta.style.height='auto';
+      ta.style.height=Math.min(ta.scrollHeight,120)+'px';
+      this.updateSendState();
+    });
+    ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();this.submitQuery();}});
+    document.getElementById('dqa-send').addEventListener('click',()=>this.submitQuery());
+  },
+
+  setSendEnabled(v){document.getElementById('dqa-send').disabled=!v;},
+
+  updateSendState(){
+    const ta=document.getElementById('dqa-input');
+    this.setSendEnabled(!ST.busy&&ST.embedReady&&!!ST.chunks.filter(c=>c.embedding).length&&!!ta.value.trim());
+  },
+
+  renderDocs(){
+    const list=document.getElementById('dqa-doc-list');
+    const stats=document.getElementById('dqa-stats-row');
+    // Treat missing status (v0.1 docs) as indexed
+    const indexed=ST.docs.filter(d=>d.status==='indexed'||!d.status);
+    const interrupted=ST.docs.filter(d=>d.status==='indexing');
+
+    if(!ST.docs.length){
+      list.innerHTML='<div class="dqa-doc-empty">No documents yet.<br>Import PDFs to build your knowledge base.</div>';
+      stats.style.display='none'; this.setHeaderSub('No documents indexed'); return;
+    }
+
+    stats.style.display='flex';
+    document.getElementById('dqa-stat-docs').textContent=indexed.length;
+    document.getElementById('dqa-stat-chunks').textContent=ST.chunks.filter(c=>c.embedding).length;
+    const kbSize=ST.chunks.reduce((s,c)=>s+c.text.length,0)/1024;
+    document.getElementById('dqa-stat-kb').textContent=kbSize>1024?`${(kbSize/1024).toFixed(1)}MB`:`${Math.round(kbSize)}KB`;
+
+    list.innerHTML=ST.docs.map(d=>{
+      if(d.status==='indexing'){
+        const pct=Math.round((d.chunksIndexed/d.chunkCount)*100)||0;
+        return `<div class="dqa-doc-card" id="dqa-dc-${d.id}">
+          <div class="dqa-doc-icon">📄</div>
+          <div class="dqa-doc-info" style="flex:1">
+            <div class="dqa-doc-name">${d.name}</div>
+            <div class="dqa-doc-meta">Interrupted — ${d.chunksIndexed} of ${d.chunkCount} chunks (${pct}%)</div>
+            <div class="dqa-resume-actions">
+              <button class="dqa-btn dqa-btn-primary dqa-btn-sm" onclick="window._DQA.resumeDoc('${d.id}')">↺ Resume</button>
+              <button class="dqa-btn dqa-btn-danger dqa-btn-sm" onclick="window._DQA.discardDoc('${d.id}')">✕ Discard</button>
+            </div>
+          </div>
+          <span class="dqa-chip interrupted">paused</span>
+        </div>`;
+      }
+      return `<div class="dqa-doc-card">
+        <div class="dqa-doc-icon">📄</div>
+        <div class="dqa-doc-info">
+          <div class="dqa-doc-name">${d.name}</div>
+          <div class="dqa-doc-meta">${d.pages} pages · ${d.chunkCount} chunks · ${Math.round(d.size/1024)}KB</div>
+        </div>
+        <span class="dqa-chip ok">Indexed</span>
+        <button class="dqa-btn dqa-btn-secondary dqa-btn-sm" onclick="window._DQA.removeDoc('${d.id}')">✕</button>
+      </div>`;
+    }).join('');
+
+    const sub=interrupted.length
+      ?`${indexed.length} indexed · ${interrupted.length} interrupted`
+      :`${indexed.length} doc${indexed.length!==1?'s':''} · ${ST.chunks.filter(c=>c.embedding).length} chunks`;
+    this.setHeaderSub(sub);
+    this.refreshBanners(); this.updateSendState();
+  },
+
+  addIngesting(tempId,name){
+    document.getElementById('dqa-doc-list').querySelector('.dqa-doc-empty')?.remove();
+    document.getElementById('dqa-stats-row').style.display='flex';
+    const div=document.createElement('div');
+    div.className='dqa-doc-card'; div.id=`dqa-dc-${tempId}`;
+    div.innerHTML=`<div class="dqa-doc-icon">📄</div>
+      <div class="dqa-doc-info" style="flex:1">
+        <div class="dqa-doc-name">${name}</div>
+        <div class="dqa-doc-meta" id="dqa-dm-${tempId}">Preparing…</div>
+        <div class="dqa-doc-progress"><div class="dqa-doc-progress-fill" id="dqa-dp-${tempId}" style="width:0%"></div></div>
+      </div>
+      <span class="dqa-chip busy">indexing</span>`;
+    document.getElementById('dqa-doc-list').appendChild(div);
+  },
+
+  // msg, pct, done, total — shows "Embedding… (47 / 312)"
+  updateIngesting(tempId,msg,pct,done,total){
+    const m=document.getElementById(`dqa-dm-${tempId}`);
+    const p=document.getElementById(`dqa-dp-${tempId}`);
+    if(m) m.textContent=total>0&&done>0?`${msg} (${done} / ${total})`:msg;
+    if(p) p.style.width=pct+'%';
+  },
+
+  initImport(){
+    document.getElementById('dqa-import-btn').addEventListener('click',()=>{
+      if(!ST.embedReady){alert('Load the embedding model first (Models tab).');return;}
+      document.getElementById('dqa-file-input').click();
+    });
+    document.getElementById('dqa-file-input').addEventListener('change',async e=>{
+      const files=Array.from(e.target.files); e.target.value='';
+      for(const file of files){
+        const tempId=`tmp_${Date.now()}`;
+        const name=file.name.replace(/\.pdf$/i,'');
+        this.addIngesting(tempId,name);
+        try{
+          await INGEST.processFile(file,(msg,pct,done,total)=>this.updateIngesting(tempId,msg,pct,done,total));
+          document.getElementById(`dqa-dc-${tempId}`)?.remove();
+        }catch(err){
+          const chip=document.getElementById(`dqa-dchip-${tempId}`);
+          if(chip){chip.textContent='error';chip.className='dqa-chip err';}
+          this.updateIngesting(tempId,`Error: ${err.message}`,0,0,0);
+        }
+      }
+      this.renderDocs();
+    });
+  },
+
+  async resumeDoc(docId){
+    if(!ST.embedReady){alert('Load the embedding model first.');return;}
+    const doc=ST.docs.find(d=>d.id===docId); if(!doc) return;
+    const card=document.getElementById(`dqa-dc-${docId}`);
+    if(card) card.innerHTML=`<div class="dqa-doc-icon">📄</div>
+      <div class="dqa-doc-info" style="flex:1">
+        <div class="dqa-doc-name">${doc.name}</div>
+        <div class="dqa-doc-meta" id="dqa-dm-${docId}">Resuming…</div>
+        <div class="dqa-doc-progress"><div class="dqa-doc-progress-fill" id="dqa-dp-${docId}" style="width:0%"></div></div>
+      </div>
+      <span class="dqa-chip busy">resuming</span>`;
+    try{
+      await INGEST.resumeDoc(doc,(msg,pct,done,total)=>this.updateIngesting(docId,msg,pct,done,total));
+    }catch(err){alert(`Resume failed: ${err.message}`);}
+    this.renderDocs();
+  },
+
+  async discardDoc(docId){
+    if(!confirm('Discard this interrupted import?')) return;
+    await DB.deleteDoc(docId);
+    ST.docs=ST.docs.filter(d=>d.id!==docId);
+    ST.chunks=ST.chunks.filter(c=>c.docId!==docId);
+    this.renderDocs();
+  },
+
+  async removeDoc(docId){
+    await DB.deleteDoc(docId);
+    ST.docs=ST.docs.filter(d=>d.id!==docId);
+    ST.chunks=ST.chunks.filter(c=>c.docId!==docId);
+    this.renderDocs();
+  },
+
+  async initModels(){
+    const dev = await LLM.detectDevice();
+    ST.webgpuOk = dev.webgpu;
+
+    const info = document.getElementById('dqa-device-info');
+    if(!dev.webgpu){
+      document.getElementById('dqa-webgpu-warn').style.display='block';
+      info.style.display='none';
+    } else {
+      info.textContent = `Device: ${dev.label} — incompatible models are disabled automatically.`;
+    }
+
+    // Set active model from saved preference (or auto default)
+    const chosen = LLM.currentModel();
+    if(chosen) CFG.LLM_MODEL = chosen;
+
+    this.renderModelPicker();
+
+    document.getElementById('dqa-embed-btn').addEventListener('click',async()=>{
+      const btn=document.getElementById('dqa-embed-btn');
+      const chip=document.getElementById('dqa-embed-chip');
+      const bar=document.getElementById('dqa-embed-prog');
+      const fill=document.getElementById('dqa-embed-fill');
+      btn.disabled=true; btn.textContent='Loading…';
+      chip.className='dqa-chip busy'; chip.textContent='Loading';
+      bar.style.display='block'; this.setStatus('LOADING','loading');
+      try{
+        await EMBED.load(p=>{fill.style.width=p+'%';});
+        chip.className='dqa-chip ok'; chip.textContent='Ready';
+        btn.textContent='Loaded ✓'; bar.style.display='none';
+        this.setStatus('READY','ready'); this.refreshBanners(); this.updateSendState();
+      }catch(err){
+        chip.className='dqa-chip err'; chip.textContent='Error';
+        btn.disabled=false; btn.textContent='Retry'; this.setStatus('ERROR','');
+      }
+    });
+  },
+
+  // ── Model picker ─────────────────────────────────────────────
+  renderModelPicker(){
+    const root = document.getElementById('dqa-model-picker');
+    if(!ST.webgpuOk){ root.innerHTML=''; return; }
+    const tierLabel = {best:'Best quality', balanced:'Balanced', light:'Light'};
+
+    root.innerHTML = MODELCAT.map(m=>{
+      const compat   = LLM.isCompatible(m);
+      const selected = m.id===CFG.LLM_MODEL;
+      // "Loaded" requires BOTH the ready flag AND a live engine object —
+      // prevents showing Loaded after a refresh cleared the engine.
+      const loaded   = selected && ST.llmReady && !!ST.llm;
+      let action;
+      if(!compat){
+        action = `<div class="dqa-mp-incompat-reason">Needs more GPU memory than this device provides</div>`;
+      } else if(loaded){
+        action = `<span class="dqa-chip ok">Loaded ✓</span>`;
+      } else if(selected){
+        action = `<div class="dqa-mp-actions" style="width:100%">
+          <button class="dqa-btn dqa-btn-primary dqa-btn-sm" id="dqa-mp-load-${m.id}"
+            onclick="window._DQA.loadModel('${m.id}')">Download &amp; Load (${m.dl})</button>
+          <div class="dqa-mp-progress" id="dqa-mp-prog-${m.id}"><div class="dqa-mp-progress-fill" id="dqa-mp-fill-${m.id}"></div></div>
+        </div>`;
+      } else {
+        action = `<button class="dqa-btn dqa-btn-secondary dqa-btn-sm"
+          onclick="window._DQA.selectModel('${m.id}')">Select</button>`;
+      }
+      return `<div class="dqa-mp-card ${selected?'selected':''} ${compat?'':'incompatible'}">
+        <div class="dqa-mp-head">
+          <div>
+            <div class="dqa-mp-name">${m.name}</div>
+            <div class="dqa-mp-size">${m.dl} download</div>
+          </div>
+          <span class="dqa-mp-tier ${m.tier}">${tierLabel[m.tier]}</span>
+        </div>
+        <div class="dqa-mp-pros">
+          <span class="pro">＋ ${m.pros}</span><br>
+          <span class="con">－ ${m.cons}</span>
+        </div>
+        ${action}
+      </div>`;
+    }).join('');
+  },
+
+  selectModel(id){
+    const m = MODELCAT.find(x=>x.id===id);
+    if(!m || !LLM.isCompatible(m)) return;  // failsafe
+    if(ST.llmReady && !confirm('Switching models requires downloading and loading the new model. Continue?')) return;
+    CFG.LLM_MODEL = id;
+    localStorage.setItem(CFG.MODEL_PREF_KEY, id);
+    ST.llmReady = false; ST.llm = null;
+    this.renderModelPicker();
+  },
+
+  async loadModel(id){
+    if(id!==CFG.LLM_MODEL) return;
+    const btn  = document.getElementById(`dqa-mp-load-${id}`);
+    const bar  = document.getElementById(`dqa-mp-prog-${id}`);
+    const fill = document.getElementById(`dqa-mp-fill-${id}`);
+    if(btn){ btn.disabled=true; btn.textContent='Downloading…'; }
+    if(bar) bar.style.display='block';
+    try{
+      await LLM.load(p=>{ if(fill) fill.style.width=p+'%'; });
+      this.renderModelPicker();
+    }catch(err){
+      if(btn){ btn.disabled=false; btn.textContent='Retry'; }
+      alert(`Model load failed: ${err.message}`);
+    }
+  },
+
+  initKB(){
+    document.getElementById('dqa-kb-export').addEventListener('click',()=>{
+      if(!ST.docs.length){alert('Nothing to export.');return;} KB.export();
+    });
+    document.getElementById('dqa-kb-import').addEventListener('click',()=>
+      document.getElementById('dqa-kb-file').click());
+    document.getElementById('dqa-kb-file').addEventListener('change',async e=>{
+      const file=e.target.files[0]; e.target.value=''; if(!file) return;
+      try{
+        const pkg=await KB.import(file);
+        document.getElementById('dqa-kb-detail').textContent=
+          `v${pkg.schema} · ${pkg.docs.length} docs · ${pkg.chunks.length} chunks · ${new Date(pkg.exported).toLocaleDateString()}`;
+        this.renderDocs();
+      }catch(err){alert(`Import failed: ${err.message}`);}
+    });
+    document.getElementById('dqa-kb-clear').addEventListener('click',async()=>{
+      if(!confirm('Clear all indexed documents?')) return;
+      await DB.clearAll(); ST.docs=[]; ST.chunks=[]; this.renderDocs();
+    });
+  },
+
+  initFeedback(){
+    document.getElementById('dqa-fb-export').addEventListener('click',async()=>{
+      const {total}=await FEEDBACK.count();
+      if(!total){alert('No feedback logged yet.');return;}
+      await FEEDBACK.exportJSON();
+    });
+    document.getElementById('dqa-fb-clear').addEventListener('click',async()=>{
+      if(!confirm('Clear all logged feedback?')) return;
+      await DB.clearFeedback(); this.refreshFeedbackDetail();
+    });
+    this.refreshFeedbackDetail();
+  },
+
+  async refreshFeedbackDetail(){
+    const {total,rated}=await FEEDBACK.count();
+    document.getElementById('dqa-fb-detail').textContent=
+      total?`${total} queries logged · ${rated} rated`:'No feedback logged yet';
+  },
+
+  // ── Curator ───────────────────────────────────────────────────
+  initCurator(){
+    // Threshold slider
+    const slider = document.getElementById('dqa-threshold-slider');
+    const val    = document.getElementById('dqa-threshold-val');
+    slider.addEventListener('input', ()=>{
+      CFG.GOLDEN_THRESHOLD = parseFloat(slider.value);
+      val.textContent = slider.value;
+    });
+    this.renderCurator();
+  },
+
+  async renderCurator(){
+    await this._renderFlagged();
+    await this._renderPending();
+    await this._renderGolden();
+  },
+
+  async _renderFlagged(){
+    const list = document.getElementById('dqa-flagged-list');
+    const all  = await DB.getAll('feedback');
+    const bad  = all.filter(f=>f.rating==='down');
+    if(!bad.length){
+      list.innerHTML='<div class="dqa-empty-curator">No flagged queries yet.<br>Rate answers 👎 in Chat to see them here.</div>';
+      return;
+    }
+    list.innerHTML = bad.map(f=>`
+      <div class="dqa-flagged-card">
+        <div class="dqa-flagged-query">❓ ${f.query}</div>
+        <details class="dqa-flagged-bad">
+          <summary>Bad answer ▸</summary>
+          <div style="margin-top:6px;white-space:pre-wrap">${f.answer||'(retrieval-only — no generated answer)'}</div>
+        </details>
+        <textarea class="dqa-curator-textarea" id="dqa-ta-${f.id}"
+          placeholder="Write the correct, complete answer here…"></textarea>
+        <button class="dqa-btn dqa-btn-primary dqa-btn-sm"
+          onclick="window._DQA.promoteGolden('${f.id}')">⭐ Save as Golden Pair</button>
+      </div>`).join('');
+  },
+
+  async _renderGolden(){
+    const list  = document.getElementById('dqa-golden-list');
+    const count = document.getElementById('dqa-golden-count');
+    const pairs = GOLDEN._pairs.filter(p=>p.authority==='curator'||p.authority==='approved');
+    count.textContent = pairs.length ? `(${pairs.length})` : '';
+    if(!pairs.length){
+      list.innerHTML='<div class="dqa-empty-curator">No golden pairs saved yet.<br>Write correct answers for flagged queries above.</div>';
+      return;
+    }
+    list.innerHTML = [...pairs].reverse().map(p=>{
+      const badge = p.authority==='curator'
+        ? `<span class="dqa-chip ok">⭐ Verified</span>`
+        : `<span class="dqa-chip busy">👥 Community</span>`;
+      return `<div class="dqa-golden-card">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+          <div class="dqa-golden-query">Matches: "${p.query}"</div>
+          ${badge}
+        </div>
+        <div class="dqa-golden-answer">${p.answer}</div>
+        <div class="dqa-golden-meta">${new Date(p.created).toLocaleDateString()}</div>
+        <div class="dqa-golden-actions">
+          <button class="dqa-btn dqa-btn-danger dqa-btn-sm"
+            onclick="window._DQA.deleteGolden('${p.id}')">✕ Remove</button>
+        </div>
+      </div>`;
+    }).join('');
+  },
+
+  async _renderPending(){
+    const list  = document.getElementById('dqa-pending-list');
+    const count = document.getElementById('dqa-pending-count');
+    const pairs = GOLDEN._pairs.filter(p=>p.authority==='pending');
+    count.textContent = pairs.length ? `(${pairs.length})` : '';
+    if(!pairs.length){
+      list.innerHTML='<div class="dqa-empty-curator">No user suggestions pending.</div>';
+      return;
+    }
+    list.innerHTML = [...pairs].reverse().map(p=>`
+      <div class="dqa-golden-card" style="border-color:var(--warning)">
+        <div class="dqa-golden-query" style="color:var(--warning)">⏳ User suggestion: "${p.query}"</div>
+        <div class="dqa-golden-answer">${p.answer}</div>
+        <div class="dqa-golden-meta">${new Date(p.created).toLocaleDateString()}</div>
+        <div class="dqa-golden-actions">
+          <button class="dqa-btn dqa-btn-primary dqa-btn-sm"
+            onclick="window._DQA.curatorizeGolden('${p.id}')">⭐ Promote to Verified</button>
+          <button class="dqa-btn dqa-btn-secondary dqa-btn-sm"
+            onclick="window._DQA.approveGolden('${p.id}')">👥 Approve as Community</button>
+          <button class="dqa-btn dqa-btn-danger dqa-btn-sm"
+            onclick="window._DQA.deleteGolden('${p.id}')">✕ Discard</button>
+        </div>
+      </div>`).join('');
+  }
+};
+
+// ================================================================
+// INIT
+// ================================================================
+async function init(){
+  await DB.open();
+  ST.docs   = await DB.getAll('docs');
+  ST.chunks = await DB.getAll('chunks');
+  await GOLDEN.load();
+
+  UI.initTabs();
+  UI.initChatInput();
+  await UI.initModels();
+  UI.initKB();
+  UI.initFeedback();
+  UI.initImport();
+  UI.initCurator();
+  UI.renderDocs();
+  UI.refreshBanners();
+  UI.setStatus('OFFLINE','');
+
+  window._DQA = {
+    removeDoc:    id=>UI.removeDoc(id),
+    resumeDoc:    id=>UI.resumeDoc(id),
+    discardDoc:   id=>UI.discardDoc(id),
+    openContext:  id=>CONTEXT.open(id),
+    retryQuery:   q=>UI.retryQuery(q),
+    selectModel:  id=>UI.selectModel(id),
+    loadModel:    id=>UI.loadModel(id),
+    closeSheet:   ()=>CONTEXT.close(),
+
+    deleteGolden: async id=>{
+      await GOLDEN.remove(id);
+      UI._renderGolden();
+    },
+
+    // Curator promotes a flagged query to curator-level golden pair
+    promoteGolden: async feedbackId=>{
+      const ta = document.getElementById(`dqa-ta-${feedbackId}`);
+      const answer = ta?.value?.trim();
+      if(!answer){alert('Write an answer first.');return;}
+      if(!ST.embedReady){alert('Load the embedding model first.');return;}
+      const all   = await DB.getAll('feedback');
+      const entry = all.find(f=>f.id===feedbackId);
+      if(!entry) return;
+      await GOLDEN.add(entry.query, answer, 'curator', feedbackId);
+      await UI._renderGolden();
+      await UI._renderFlagged();
+      alert('Saved as Verified Answer. Future similar queries will use this as authoritative context.');
+    },
+
+    // Approve a pending user suggestion (curator action)
+    approveGolden: async id=>{
+      await GOLDEN.update(id, {authority:'approved'});
+      UI._renderGolden();
+      UI._renderPending();
+    },
+
+    // Promote pending to curator level (curator action, may edit first)
+    curatorizeGolden: async id=>{
+      const pair = GOLDEN._pairs.find(p=>p.id===id); if(!pair) return;
+      const edited = prompt('Edit answer before promoting to Verified:', pair.answer);
+      if(edited===null) return;
+      await GOLDEN.update(id, {authority:'curator', answer:edited||pair.answer});
+      UI._renderGolden();
+      UI._renderPending();
+    },
+
+    // User submits a suggested answer (saves as pending)
+    suggestAnswer: async feedbackId=>{
+      const ta = document.getElementById(`dqa-sug-ta-${feedbackId}`);
+      const answer = ta?.value?.trim();
+      if(!answer) return;
+      if(!ST.embedReady){alert('Load the embedding model first.');return;}
+      const all   = await DB.getAll('feedback');
+      const entry = all.find(f=>f.id===feedbackId);
+      if(!entry) return;
+      await GOLDEN.add(entry.query, answer, 'pending', feedbackId);
+      ta.value='';
+      document.getElementById(`dqa-suggest-${feedbackId}`).style.display='none';
+      alert('Suggestion submitted for curator review. Thank you!');
+    },
+
+    rate: async(id,rating,btn)=>{
+      await FEEDBACK.rate(id,rating);
+      btn.closest('.dqa-rating-row').querySelectorAll('.dqa-rate-btn').forEach(b=>b.classList.remove('active'));
+      btn.classList.add('active');
+      UI.refreshFeedbackDetail();
+      UI._renderFlagged();
+      // Show suggestion field on thumbs-down
+      if(rating==='down'){
+        const sugBox = document.getElementById(`dqa-suggest-${id}`);
+        if(sugBox) sugBox.style.display='block';
+      }
+    }
+  };
+}
+
+init().catch(err=>console.error('[DocQA] init error:',err));
+
+// ================================================================
+// PWA service worker — registers only when running standalone
+// (skipped when embedded in PairBoard, which has its own shell)
+// ================================================================
+if('serviceWorker' in navigator && !window.PB){
+  window.addEventListener('load',()=>{
+    navigator.serviceWorker.register('sw.js').catch(e=>console.warn('[DocQA] SW registration failed:',e));
+  });
+}
+
+// ================================================================
+// PairBoard module interface
+// ================================================================
+export const DocQAModule = {
+  id:'docqa', label:'Doc Search', icon:'📋',
+  init(container){container.appendChild(document.querySelector('.dqa-app'));init();},
+  destroy(){}
+};
+if(window.PB?.modules?.register) window.PB.modules.register(DocQAModule);
+</script>
+</body>
+</html>

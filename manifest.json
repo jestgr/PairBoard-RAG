@@ -1,0 +1,32 @@
+{
+  "name": "DocQA — Document Assistant",
+  "short_name": "DocQA",
+  "description": "Offline document Q&A with on-device AI. Ask questions across your PDFs and get answers with citations.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#0B2545",
+  "theme_color": "#0B2545",
+  "categories": ["productivity", "utilities", "reference"],
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icon-512-maskable.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
