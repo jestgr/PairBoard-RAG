@@ -1011,7 +1011,12 @@ const LLM = {
   isLoaded(){ return !!(ST.llmReady && ST.llm); },
 
   async load(onProgress){
-    // esm.run is WebLLM's recommended CDN; esm.sh can't bundle WASM dependencies
+    // Dispose any existing engine before creating a new one — prevents
+    // consuming a second GPU adapter while the first is still held.
+    if(ST.llm){
+      try{ await ST.llm.unload?.(); }catch{}
+      ST.llm=null; ST.llmReady=false;
+    }
     const webllm = await import('https://esm.run/@mlc-ai/web-llm');
     ST.llm = await webllm.CreateMLCEngine(CFG.LLM_MODEL, {
       initProgressCallback: p => onProgress(Math.round((p.progress??0)*100))
@@ -1052,22 +1057,10 @@ const LLM = {
   },
 
   async synthesize(query,chunks){
-    try{
-      return await this._call(query,chunks);
-    }catch(err){
-      const msg = err.message||String(err);
-      // Only attempt reload for clear GPU-context-loss errors. For anything
-      // else, throw the original so the UI can show the real cause.
-      const isGPULoss = msg.includes('GPUBuffer')||msg.includes('mapAsync')||
-        msg.includes('unmapped')||msg.includes('device is lost')||msg.includes('Device lost');
-      if(isGPULoss){
-        UI.setThinkLabel('GPU context reset — reloading…');
-        const webllm = await import('https://esm.run/@mlc-ai/web-llm');
-        ST.llm = await webllm.CreateMLCEngine(CFG.LLM_MODEL);
-        return await this._call(query,chunks);
-      }
-      throw err;  // surface real error
-    }
+    // No reload-on-error: re-initializing WebLLM while the first engine's GPU
+    // buffers are in flight unmaps them mid-operation and CAUSES the
+    // 'mapAsync unmapped' error. Let the call succeed or fail cleanly.
+    return await this._call(query,chunks);
   },
 
   async _call(query,chunks){
@@ -1414,41 +1407,13 @@ const UI = {
     }catch(err){
       console.error('[DocQA] query error:', err);
       const msg = err.message||String(err);
-      const isGPU = msg&&(msg.includes('GPUBuffer')||msg.includes('mapAsync')||
-        msg.includes('GPU')||msg.includes('lost')||msg.includes('unmapped'));
-      if(isGPU && wasHidden && chunks){
-        // Interrupted by backgrounding — retrieval succeeded, offer clean retry
-        const feedbackId=await FEEDBACK.log(query,chunks,'',false);
-        answerHtml=`<div class="dqa-bubble">
-          <div class="dqa-mode-tag">⚡ Retrieval complete · synthesis interrupted</div>
-          <div class="dqa-summary">Generation was interrupted because the app was minimized. The passages were found — tap retry to generate the full answer.</div>
-          <button class="dqa-btn dqa-btn-primary dqa-btn-sm" style="margin:8px 0"
-            onclick="window._DQA.retryQuery('${query.replace(/'/g,"\\'")}')">↻ Retry answer</button>
-          <div class="dqa-citations-label">Sources</div>
-          <div class="dqa-citations">${chunks.map(c=>`<div class="dqa-citation" onclick="window._DQA.openContext('${c.id}')">
-            <div class="dqa-citation-source">📄 ${c.docName} — p.${c.page}</div>
-            <div class="dqa-citation-quote">${c.text.replace(/\s+/g,' ').slice(0,160)}…</div>
-            <div class="dqa-citation-tap">Tap to read more ›</div>
-          </div>`).join('')}</div>
-        </div>`;
-      } else if(LLM.isLoaded() && chunks){
-        // Model IS loaded but synthesis threw — surface the REAL error.
+      if(LLM.isLoaded() && chunks){
         const feedbackId=await FEEDBACK.log(query,chunks,'synthesis_error: '+msg,false);
-        // GPU buffer crashes often clear if a SMALLER model is used. Offer that.
-        const cur = MODELCAT.find(m=>m.id===CFG.LLM_MODEL);
-        const smaller = MODELCAT.find(m=>LLM.isCompatible(m) &&
-          MODELCAT.indexOf(m) < MODELCAT.indexOf(cur));
-        const gpuCrash = msg.includes('mapAsync')||msg.includes('GPUBuffer')||msg.includes('unmapped');
-        const suggestion = (gpuCrash && smaller)
-          ? `<div class="dqa-alert info" style="margin:8px 0">This looks like a GPU memory limit on this device. A smaller model often works — tap below to switch to ${smaller.name}.</div>
-             <button class="dqa-btn dqa-btn-primary dqa-btn-sm" style="margin-bottom:8px"
-               onclick="window._DQA.switchAndLoad('${smaller.id}')">Switch to ${smaller.name} &amp; load</button>`
-          : `<button class="dqa-btn dqa-btn-primary dqa-btn-sm" style="margin:8px 0"
-               onclick="window._DQA.retryQuery('${query.replace(/'/g,"\\'")}')">↻ Retry</button>`;
         answerHtml=`<div class="dqa-bubble">
           <div class="dqa-mode-tag">⚠ Synthesis failed · showing retrieval</div>
-          <div class="dqa-summary">The model loaded but generation failed:\n\n<span style="color:var(--danger);font-family:var(--font-mono);font-size:12px">${msg}</span></div>
-          ${suggestion}
+          <div class="dqa-summary">Generation failed:\n\n<span style="color:var(--danger);font-family:var(--font-mono);font-size:12px">${msg}</span></div>
+          <button class="dqa-btn dqa-btn-primary dqa-btn-sm" style="margin:8px 0"
+            onclick="window._DQA.retryQuery('${query.replace(/'/g,"\\'")}')">↻ Retry</button>
           <div class="dqa-citations-label">Sources</div>
           <div class="dqa-citations">${chunks.map(c=>`<div class="dqa-citation" onclick="window._DQA.openContext('${c.id}')">
             <div class="dqa-citation-source">📄 ${c.docName} — p.${c.page}</div>
