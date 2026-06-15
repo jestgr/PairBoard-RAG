@@ -544,51 +544,50 @@ const CFG = {
 
 // ================================================================
 // MODELCAT — selectable LLM catalog
-// All q4f32 (no shader-f16 requirement) for cross-platform safety.
-// maxTier gates compatibility against detected device tier:
-//   'universal' — runs on any WebGPU device incl. limited mobile
-//   'standard'  — needs a mid/high device (flagship phone, tablet, desktop)
-//   'desktop'   — desktop-class GPU / M-series Mac only
+// q4f16 variants (require shader-f16). The WebGPU diagnostic confirmed
+// shader-f16 support + working q4f16 inference on target devices. The
+// app falls back to retrieval-only where WebGPU/shader-f16 is absent.
+// maxTier gates compatibility against detected device tier.
 // ================================================================
 const MODELCAT = [
   {
-    id:   'Llama-3.2-1B-Instruct-q4f32_1-MLC',
+    id:   'Qwen2.5-0.5B-Instruct-q4f16_1-MLC',
+    name: 'Qwen 2.5 · 0.5B', dl:'~350 MB', maxTier:'universal', tier:'light',
+    pros: 'Smallest & fastest · proven to run on mobile WebGPU',
+    cons: 'Most basic synthesis — best for simple, direct questions',
+  },
+  {
+    id:   'Llama-3.2-1B-Instruct-q4f16_1-MLC',
     name: 'Llama 3.2 · 1B', dl:'~700 MB', maxTier:'universal', tier:'light',
-    pros: 'Fastest · smallest download · runs on any WebGPU device',
-    cons: 'Basic synthesis — may miss nuance on complex multi-source questions',
+    pros: 'Fast · small download · solid for everyday lookups',
+    cons: 'May miss nuance on complex multi-source questions',
   },
   {
-    id:   'SmolLM2-1.7B-Instruct-q4f32_1-MLC',
-    name: 'SmolLM2 · 1.7B', dl:'~1.0 GB', maxTier:'universal', tier:'light',
-    pros: 'Quick responses · efficient · good for simple lookups',
-    cons: 'Similar limits to 1B on complex synthesis',
-  },
-  {
-    id:   'Llama-3.2-3B-Instruct-q4f32_1-MLC',
+    id:   'Llama-3.2-3B-Instruct-q4f16_1-MLC',
     name: 'Llama 3.2 · 3B', dl:'~1.7 GB', maxTier:'universal', tier:'balanced',
-    pros: 'Solid multi-source synthesis · good speed · works on most modern phones',
+    pros: 'Solid multi-source synthesis · good speed on modern phones',
     cons: 'Larger download · slower than 1B on older devices',
   },
   {
-    id:   'Hermes-3-Llama-3.2-3B-q4f32_1-MLC',
+    id:   'Hermes-3-Llama-3.2-3B-q4f16_1-MLC',
     name: 'Hermes 3 · 3B', dl:'~1.7 GB', maxTier:'universal', tier:'balanced',
-    pros: 'Tuned for following structured formats — best citation reliability at this size',
+    pros: 'Tuned for structured formats — best citation reliability at this size',
     cons: 'Same hardware needs as Llama 3B',
   },
   {
-    id:   'Phi-3.5-mini-instruct-q4f32_1-MLC',
+    id:   'Phi-3.5-mini-instruct-q4f16_1-MLC',
     name: 'Phi 3.5 Mini · 3.8B', dl:'~2.2 GB', maxTier:'standard', tier:'best',
     pros: 'Strong reasoning on regulatory text · excellent instruction following',
     cons: 'Needs flagship phone or desktop · big download',
   },
   {
-    id:   'Mistral-7B-Instruct-v0.3-q4f32_1-MLC',
+    id:   'Mistral-7B-Instruct-v0.3-q4f16_1-MLC',
     name: 'Mistral · 7B', dl:'~4.0 GB', maxTier:'desktop', tier:'best',
     pros: 'Near-desktop quality synthesis · handles dense multi-document context',
     cons: 'Desktop / M-series Mac only · long first download',
   },
   {
-    id:   'Llama-3.1-8B-Instruct-q4f32_1-MLC',
+    id:   'Llama-3.1-8B-Instruct-q4f16_1-MLC',
     name: 'Llama 3.1 · 8B', dl:'~4.6 GB', maxTier:'desktop', tier:'best',
     pros: 'Best available quality — thorough answers, best edge-case coverage',
     cons: 'Desktop-class GPU required · largest download',
@@ -958,30 +957,29 @@ const LLM = {
   async detectDevice(){
     try{
       const adapter = await navigator.gpu?.requestAdapter();
-      if(!adapter){ this.device={webgpu:false,maxBuf:0,tier:'none',label:'No WebGPU'}; return this.device; }
+      if(!adapter){ this.device={webgpu:false,maxBuf:0,tier:'none',f16:false,label:'No WebGPU'}; return this.device; }
       const maxBuf = adapter.limits?.maxBufferSize ?? 0;
       const maxStorage = adapter.limits?.maxStorageBufferBindingSize ?? 0;
       const mb = Math.round(maxBuf/1048576);
-      // Effective capacity: take the larger of the two reported limits — some
-      // browsers report a low maxBufferSize but a higher storage binding size.
       const effMb = Math.round(Math.max(maxBuf, maxStorage)/1048576);
+      const f16 = adapter.features?.has?.('shader-f16') ?? false;
       let tier, label;
       if      (effMb >= 4000) { tier='high'; label=`Capable GPU detected`; }
       else if (effMb >= 1800) { tier='mid';  label=`Standard GPU detected`; }
       else                    { tier='low';  label=`Limited GPU detected`; }
-      this.device = { webgpu:true, maxBuf:mb, effMb, tier, label };
-    }catch{ this.device={webgpu:false,maxBuf:0,effMb:0,tier:'none',label:'No WebGPU'}; }
+      if(!f16) label += ' · no shader-f16 (synthesis unavailable)';
+      this.device = { webgpu:true, maxBuf:mb, effMb, tier, f16, label };
+    }catch{ this.device={webgpu:false,maxBuf:0,effMb:0,tier:'none',f16:false,label:'No WebGPU'}; }
     return this.device;
   },
 
-  // Compatibility uses a model's KNOWN working tier rather than raw VRAM math,
-  // since maxBufferSize underreports on mobile. Maps device tier → allowed models.
+  // q4f16 models need shader-f16. Without it, no model is compatible → retrieval-only.
   isCompatible(model){
-    if(!this.device.webgpu) return false;
+    if(!this.device.webgpu || !this.device.f16) return false;
     const t = this.device.tier;
-    if(t==='high') return true;                    // run anything
-    if(t==='mid')  return model.maxTier!=='desktop'; // up through Phi/Mistral-light
-    if(t==='low')  return model.maxTier==='universal'; // 1B / SmolLM / 3B
+    if(t==='high') return true;
+    if(t==='mid')  return model.maxTier!=='desktop';
+    if(t==='low')  return model.maxTier==='universal';
     return false;
   },
 
