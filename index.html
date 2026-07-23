@@ -182,6 +182,11 @@ textarea{font-family:var(--font-ui);}
 .dqa-think-label input:checked ~ .dqa-think-switch{background:var(--accent);}
 .dqa-think-label input:checked ~ .dqa-think-switch::after{transform:translateX(16px);}
 /* Reasoning block in answers */
+.dqa-profile-row{display:flex;gap:var(--s-2);margin-bottom:12px;}
+.dqa-profile-btn{flex:1;padding:8px 6px;border-radius:var(--r-lg);border:1.5px solid var(--border-subtle);background:var(--bg-surface);text-align:center;cursor:pointer;}
+.dqa-profile-btn.active{border-color:var(--accent);background:var(--accent-subtle);}
+.dqa-profile-name{font-size:var(--text-footnote);font-weight:600;}
+.dqa-profile-desc{font-size:var(--text-caption);color:var(--text-tertiary);line-height:1.35;margin-top:2px;}
 .dqa-stream-preview{margin-top:var(--s-2);font-size:var(--text-footnote);line-height:1.5;color:var(--text-secondary);white-space:pre-wrap;max-height:150px;overflow:hidden;}
 .dqa-think-block{margin:var(--s-2) 0;border:1px solid var(--border-subtle);border-radius:var(--r-lg);background:var(--bg-subtle);overflow:hidden;}
 .dqa-think-block summary{padding:var(--s-2) var(--s-3);font-size:var(--text-caption);font-weight:600;color:var(--accent);cursor:pointer;list-style:none;}
@@ -448,6 +453,8 @@ textarea{font-family:var(--font-ui);}
             <input type="checkbox" id="dqa-gpu-check" onchange="window._DQA.toggleGpu(this.checked)">
             <span class="dqa-think-switch"></span>
           </label>
+          <div class="dqa-label" style="margin-top:4px">Answer depth</div>
+          <div class="dqa-profile-row" id="dqa-profile-row"></div>
           <div class="dqa-model-card" id="dqa-selftest-card" style="margin-bottom:12px;border-color:var(--accent-muted)">
             <div class="dqa-model-name">🔧 Synthesis self-test</div>
             <div class="dqa-model-detail">Runs three escalating generations to pinpoint exactly where synthesis fails on this device. Load a model first.</div>
@@ -573,11 +580,17 @@ const CFG = {
   CHUNK_OVERLAP:     50,
   INGEST_BATCH:      20,
   TOP_K:             12,    // passages retrieved & shown as sources
-  LLM_CONTEXT_K:     5,     // chunks fed to the model (prefill dominates CPU cost)
-  LLM_CONTEXT_K_THINK: 3,   // fewer when thinking (reasoning needs token room)
-  CHUNK_WORD_CAP:    150,   // words per chunk fed to the model
-  MAX_TOKENS:        320,   // normal answer budget
-  MAX_TOKENS_THINK:  700,   // thinking: reasoning block + answer
+  // Speed profiles — prefill dominates CPU cost, so chunk count and word cap
+  // are the main levers. Users pick how much time/battery a chat may spend.
+  PROFILES: {
+    fast:     { k:3, kThink:2, words:120, tokens:200, tokensThink:450,
+                label:'Fast',     desc:'Quickest answers · fewest sources' },
+    balanced: { k:5, kThink:3, words:150, tokens:320, tokensThink:700,
+                label:'Balanced', desc:'Good detail at reasonable speed' },
+    thorough: { k:8, kThink:5, words:200, tokens:512, tokensThink:1024,
+                label:'Thorough', desc:'Most sources · slowest' },
+  },
+  PROFILE_KEY:       'dqa.profile',
   N_CTX:             4096,  // llama.cpp context window (RAM cost scales with this)
   GOLDEN_THRESHOLD:  0.82,  // cosine similarity to trigger golden pair injection
   EMBED_MODEL:       'Xenova/all-MiniLM-L6-v2',
@@ -1095,7 +1108,21 @@ const LLM = {
 
   isLoaded(){ return !!(ST.llmReady && this._w); },
 
+  profile(){
+    const p = localStorage.getItem(CFG.PROFILE_KEY) || 'balanced';
+    return CFG.PROFILES[p] ? p : 'balanced';
+  },
+  budget(){ return CFG.PROFILES[this.profile()]; },
+
   gpuLayers(){ return parseInt(localStorage.getItem(CFG.GPU_KEY) || '0', 10) || 0; },
+
+  // Reload the current model on CPU after a GPU backend proves unreliable.
+  async reloadForCpu(log){
+    const g=document.getElementById('dqa-gpu-check'); if(g) g.checked=false;
+    if(log) log('   … reloading model on CPU');
+    await this.load(()=>{});
+    if(log) log('   ✓ reloaded on CPU');
+  },
   setGpuLayers(n){ try{ localStorage.setItem(CFG.GPU_KEY, String(n)); }catch{} },
 
   async unload(){
@@ -1181,11 +1208,12 @@ const LLM = {
 
   async _call(query,chunks,onToken){
     const thinking = this.thinkingActive();
-    const k        = thinking ? CFG.LLM_CONTEXT_K_THINK : CFG.LLM_CONTEXT_K;
-    const maxTok   = thinking ? CFG.MAX_TOKENS_THINK    : CFG.MAX_TOKENS;
+    const b        = this.budget();
+    const k        = thinking ? b.kThink : b.k;
+    const maxTok   = thinking ? b.tokensThink : b.tokens;
 
     const ctx = chunks.slice(0, k).map(c=>({
-      ...c, text: c.text.split(/\s+/).slice(0, CFG.CHUNK_WORD_CAP).join(' ')
+      ...c, text: c.text.split(/\s+/).slice(0, b.words).join(' ')
     }));
 
     const opts = {
@@ -1859,6 +1887,7 @@ const UI = {
     if(chk) chk.checked = auto;
     const gchk = document.getElementById('dqa-gpu-check');
     if(gchk) gchk.checked = LLM.gpuLayers() > 0;
+    this.renderProfiles();
 
     this.renderModelPicker();
 
@@ -1883,6 +1912,17 @@ const UI = {
 
     // Auto-load the chosen model from cache (no network if already downloaded)
     if(auto) this.loadModel(CFG.LLM_MODEL).catch(e=>console.warn('[DocQA] autoload:',e));
+  },
+
+  renderProfiles(){
+    const row = document.getElementById('dqa-profile-row');
+    if(!row) return;
+    const cur = LLM.profile();
+    row.innerHTML = Object.entries(CFG.PROFILES).map(([key,p])=>
+      `<div class="dqa-profile-btn ${key===cur?'active':''}" onclick="window._DQA.setProfile('${key}')">
+        <div class="dqa-profile-name">${p.label}</div>
+        <div class="dqa-profile-desc">${p.desc}</div>
+      </div>`).join('');
   },
 
   // ── Model picker ─────────────────────────────────────────────
@@ -2154,18 +2194,44 @@ async function init(){
         log('1. Short generation…');
         const r = await LLM._w.createChatCompletion({
           messages:[{role:'user',content:'Say hello in three words.'+nt}], max_tokens:24 });
-        log('   ✓ "'+LLM.splitThinking(r.choices[0].message.content).answer.trim()+'"');
-      }catch(e){ log('   ✗ FAIL — '+(e.message||e)); return done(); }
+        const txt = LLM.splitThinking(r.choices[0].message.content).answer.trim();
+        log('   ✓ "'+txt+'"');
+        // Broken backends emit repeated-token spam rather than erroring.
+        const words = txt.toLowerCase().split(/\s+/).filter(Boolean);
+        const repeated = words.length>6 && new Set(words).size <= Math.max(2, words.length/6);
+        if(repeated && LLM.gpuLayers()>0){
+          log('   ⚠ Output looks corrupted — GPU backend is unreliable here.');
+          log('   → Disabling GPU acceleration and switching to CPU.');
+          LLM.setGpuLayers(0);
+          await LLM.reloadForCpu(log);
+        }
+      }catch(e){
+        log('   ✗ FAIL — '+(e.message||e));
+        if(LLM.gpuLayers()>0){
+          log('   → GPU backend failed. Disabling it and retrying on CPU.');
+          LLM.setGpuLayers(0);
+          try{ await LLM.reloadForCpu(log); }catch(e2){ log('   ✗ CPU reload failed — '+(e2.message||e2)); return done(); }
+        } else return done();
+      }
 
       try{
-        log('2. Long prompt ('+CFG.LLM_CONTEXT_K+' chunks worth)…');
+        log('2. Long prompt ('+LLM.budget().k+' chunks worth)…');
         const filler = 'The reserve guarantee equals the average line value minus two hours. '.repeat(120);
         const t1 = performance.now();
         const r = await LLM._w.createChatCompletion({
           messages:[{role:'user',content:filler+'\nSummarize that rule.'+nt}], max_tokens:120 });
         const secs = ((performance.now()-t1)/1000).toFixed(1);
         log('   ✓ PASS in '+secs+'s');
-      }catch(e){ log('   ✗ FAIL — '+(e.message||e)); return done(); }
+      }catch(e){
+        log('   ✗ FAIL — '+(e.message||e));
+        if(LLM.gpuLayers()>0){
+          log('   → Disabling GPU acceleration; re-run the test on CPU.');
+          LLM.setGpuLayers(0);
+          const g=document.getElementById('dqa-gpu-check'); if(g) g.checked=false;
+          await LLM.unload();
+        }
+        return done();
+      }
 
       try{
         log('3. Retrieval + synthesis…');
@@ -2184,6 +2250,11 @@ async function init(){
     },
 
     dismissPending: el=>{ UI.clearPending(); el.closest('.dqa-msg')?.remove(); },
+    setProfile: key=>{
+      if(!CFG.PROFILES[key]) return;
+      try{ localStorage.setItem(CFG.PROFILE_KEY, key); }catch{}
+      UI.renderProfiles();
+    },
     toggleGpu: async on=>{
       LLM.setGpuLayers(on ? 99 : 0);   // 99 = offload all layers
       await LLM.unload();
