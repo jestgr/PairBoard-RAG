@@ -559,11 +559,11 @@ const CFG = {
   CHUNK_OVERLAP:     50,
   INGEST_BATCH:      20,
   TOP_K:             12,    // passages retrieved & shown as sources
-  LLM_CONTEXT_K:     6,     // chunks fed to LLM in normal mode (was 3)
-  LLM_CONTEXT_K_THINK: 3,   // fewer chunks when thinking mode is on (reasoning needs token room)
+  LLM_CONTEXT_K:     6,     // chunks fed to LLM in normal mode
+  LLM_CONTEXT_K_THINK: 3,   // fewer chunks when thinking (reasoning needs token room)
   CHUNK_WORD_CAP:    180,   // words per chunk fed to LLM (context-window budget)
-  MAX_TOKENS:        800,   // normal answer budget
-  MAX_TOKENS_THINK:  1400,  // larger when thinking (reasoning block + answer)
+  MAX_TOKENS:        400,   // generation length drives mapAsync failures — keep modest
+  MAX_TOKENS_THINK:  900,   // thinking needs room for its reasoning chain
   GOLDEN_THRESHOLD:  0.82,  // cosine similarity to trigger golden pair injection
   EMBED_MODEL:       'Xenova/all-MiniLM-L6-v2',
   LLM_MODEL:         'Llama-3.2-1B-Instruct-q4f16_1-MLC', // overridden by saved picker choice
@@ -1156,7 +1156,12 @@ const LLM = {
         ' After your answer, list each source cited with a short direct quote (under 20 words).' +
         ' If passages do not fully answer the question, explicitly state what is missing.' +
         ' Format:\nAnswer: [full answer]\n\nCitations:\n• [Source — Page N] — "direct quote"'},
-      {role:'user', content:`SOURCE PASSAGES:\n\n${passages}\n\nQUESTION: ${query}`}
+      // Qwen3 reads /think and /no_think control tokens from the user message.
+      // WebLLM does NOT support `extra_body.enable_thinking`, so this is the
+      // only reliable way to turn its reasoning chain on or off. Left ON by
+      // default, Qwen3 burns hundreds of tokens on hidden reasoning.
+      {role:'user', content:`SOURCE PASSAGES:\n\n${passages}\n\nQUESTION: ${query}` +
+        (this.currentIsReasoning() ? (thinking ? ' /think' : ' /no_think') : '')}
     ];
   },
 
@@ -1180,16 +1185,27 @@ const LLM = {
       temperature: thinking ? 0.6 : 0.2,   // Qwen3 thinking prefers ~0.6
       max_tokens: maxTok,
     };
-    // Qwen3 enable_thinking flag — passed through to the chat template.
-    if(this.currentIsReasoning()){
-      opts.extra_body = { enable_thinking: thinking };
-    }
 
-    // Non-streaming: one readback instead of a mapAsync per token. Streaming
-    // multiplies the number of GPU buffer mappings and with it the chance of
-    // hitting the 'unmapped before mapping resolved' race on mobile GPUs.
-    const resp = await ST.llm.chat.completions.create(opts);
-    return resp.choices[0].message.content;
+    // The mapAsync failure is INTERMITTENT and scales with the number of tokens
+    // generated (one GPU readback per token). Retrying the completion call is
+    // safe — unlike re-creating the engine, which unmaps live buffers.
+    let lastErr;
+    for(let attempt=0; attempt<3; attempt++){
+      try{
+        const resp = await ST.llm.chat.completions.create(opts);
+        return resp.choices[0].message.content;
+      }catch(err){
+        lastErr = err;
+        const msg = err.message||String(err);
+        const transient = msg.includes('mapAsync')||msg.includes('GPUBuffer')||msg.includes('unmapped');
+        if(!transient) throw err;
+        if(attempt<2){
+          UI.setThinkLabel(`GPU hiccup — retrying (${attempt+2}/3)…`);
+          await new Promise(r=>setTimeout(r, 400));
+        }
+      }
+    }
+    throw lastErr;
   },
 
   // Strip the <think>...</think> reasoning block from Qwen3 output, returning
@@ -2050,35 +2066,43 @@ async function init(){
       const log = t => { out.textContent += t+'\n'; };
       out.textContent='';
       if(!LLM.isLoaded()){ log('✗ No model loaded. Load one first.'); btn.disabled=false; btn.textContent='Run self-test'; return; }
+      const isQwen3 = LLM.currentIsReasoning();
+      const nt = isQwen3 ? ' /no_think' : '';   // suppress Qwen3 reasoning for tests
+      const done = ()=>{ btn.disabled=false; btn.textContent='Run self-test again'; };
 
-      // Test 1 — minimal prompt (mirrors the standalone diagnostic exactly)
+      const gen = (userMsg, maxTok) => ST.llm.chat.completions.create({
+        messages:[{role:'user',content:userMsg}], max_tokens:maxTok });
+
+      const bigPrompt = 'The reserve guarantee equals the average line value minus two hours. '.repeat(40);
+
+      // 1 — small in, small out
       try{
-        log('1. Minimal prompt (20 tokens)…');
-        const r = await ST.llm.chat.completions.create({
-          messages:[{role:'user',content:'Say hello in 3 words.'}], max_tokens:20 });
-        log('   ✓ PASS — "'+r.choices[0].message.content.trim()+'"');
+        log('1. Small prompt, 20 tokens…');
+        const r = await gen('Say hello in 3 words.'+nt, 20);
+        log('   ✓ PASS');
       }catch(e){ log('   ✗ FAIL — '+(e.message||e));
-        log('\n→ Generation fails even with a tiny prompt and no retrieval.');
-        log('  The problem is the app environment (PWA/worker/memory), not the prompt.');
-        btn.disabled=false; btn.textContent='Run self-test'; return; }
+        log('\n→ Fails even minimally. Problem is the app environment, not size.'); return done(); }
 
-      // Test 2 — full-size prompt, no retrieval (isolates prompt size)
+      // 2 — LARGE in, small out  (isolates INPUT size)
       try{
-        log('2. Large prompt, no retrieval ('+CFG.MAX_TOKENS+' tokens)…');
-        const filler = 'The reserve guarantee is calculated as the average line value minus two hours. '.repeat(40);
-        const r = await ST.llm.chat.completions.create({
-          messages:[{role:'system',content:'You are a reference assistant.'},
-                    {role:'user',content:filler+'\n\nQUESTION: Summarize the rule above.'}],
-          max_tokens: CFG.MAX_TOKENS });
-        log('   ✓ PASS — '+r.choices[0].message.content.trim().slice(0,60)+'…');
+        log('2. Large prompt, 20 tokens (tests input size)…');
+        await gen(bigPrompt+'\nSummarize in 3 words.'+nt, 20);
+        log('   ✓ PASS — large inputs are fine');
       }catch(e){ log('   ✗ FAIL — '+(e.message||e));
-        log('\n→ Small prompts work, large ones do not. Prompt size is the limit;');
-        log('  reduce LLM_CONTEXT_K / MAX_TOKENS.');
-        btn.disabled=false; btn.textContent='Run self-test'; return; }
+        log('\n→ INPUT size is the limit. Lower LLM_CONTEXT_K / CHUNK_WORD_CAP.'); return done(); }
 
-      // Test 3 — real pipeline: retrieval then synthesis
+      // 3 — small in, LARGE out  (isolates OUTPUT length)
       try{
-        log('3. Retrieval + synthesis (real path)…');
+        log('3. Small prompt, '+CFG.MAX_TOKENS+' tokens (tests output length)…');
+        await gen('Write a detailed paragraph about aviation scheduling.'+nt, CFG.MAX_TOKENS);
+        log('   ✓ PASS — output length is fine');
+      }catch(e){ log('   ✗ FAIL — '+(e.message||e));
+        log('\n→ OUTPUT length is the limit (one GPU readback per token).');
+        log('  Lower MAX_TOKENS. Current: '+CFG.MAX_TOKENS); return done(); }
+
+      // 4 — real pipeline
+      try{
+        log('4. Retrieval + synthesis (real path)…');
         if(!ST.embedReady){ log('   ⚠ SKIPPED — embedding model not loaded'); }
         else if(!ST.chunks.filter(c=>c.embedding).length){ log('   ⚠ SKIPPED — no indexed documents'); }
         else {
@@ -2086,13 +2110,12 @@ async function init(){
           await new Promise(r=>setTimeout(r,150));
           const txt = await LLM.synthesize('How is a reserve pilot paid?', chunks);
           log('   ✓ PASS — '+LLM.splitThinking(txt).answer.trim().slice(0,60)+'…');
-          log('\n→ All three passed. Synthesis is working; ask a question in Chat.');
+          log('\n→ All passed. Synthesis is working — ask a question in Chat.');
         }
       }catch(e){ log('   ✗ FAIL — '+(e.message||e));
-        log('\n→ Isolated generation works, but retrieval+synthesis together fails.');
-        log('  Cause is memory pressure or GPU contention from the retrieval step.'); }
-
-      btn.disabled=false; btn.textContent='Run self-test again';
+        log('\n→ Isolated generation works but the full pipeline fails:');
+        log('  memory pressure or GPU contention from retrieval.'); }
+      done();
     },
     toggleThinking: on=>{
       ST.thinking = !!on;
