@@ -15,7 +15,7 @@
    IMPORTANT: bump CACHE_VERSION on every deploy or installed users
    keep the stale shell.
    ============================================================ */
-const CACHE_VERSION = 'docqa-v20';   // <- bump this on every deploy
+const CACHE_VERSION = 'docqa-v22';   // <- bump this on every deploy
 const SHELL = [
   './',
   './index.html',

@@ -182,6 +182,14 @@ textarea{font-family:var(--font-ui);}
 .dqa-think-label input:checked ~ .dqa-think-switch{background:var(--accent);}
 .dqa-think-label input:checked ~ .dqa-think-switch::after{transform:translateX(16px);}
 /* Reasoning block in answers */
+.dqa-src-rate{display:flex;gap:6px;margin-top:6px;}
+.dqa-src-btn{font-size:var(--text-caption);padding:3px 8px;border-radius:var(--r-full);border:1px solid var(--border-subtle);background:var(--bg-surface);color:var(--text-tertiary);cursor:pointer;}
+.dqa-src-btn.up.active{background:var(--success-bg);color:var(--success);border-color:var(--success);}
+.dqa-src-btn.down.active{background:var(--danger-bg,#fde8e8);color:var(--danger);border-color:var(--danger);}
+.dqa-fb-label{font-size:var(--text-caption);font-weight:600;color:var(--text-secondary);margin-bottom:5px;}
+.dqa-issue-chips{display:flex;flex-wrap:wrap;gap:6px;}
+.dqa-issue-chip{font-size:var(--text-caption);padding:5px 10px;border-radius:var(--r-full);border:1px solid var(--border-subtle);background:var(--bg-surface);color:var(--text-secondary);cursor:pointer;}
+.dqa-issue-chip.active{background:var(--accent-subtle);border-color:var(--accent);color:var(--accent);font-weight:600;}
 .dqa-profile-row{display:flex;gap:var(--s-2);margin-bottom:12px;}
 .dqa-profile-btn{flex:1;padding:8px 6px;border-radius:var(--r-lg);border:1.5px solid var(--border-subtle);background:var(--bg-surface);text-align:center;cursor:pointer;}
 .dqa-profile-btn.active{border-color:var(--accent);background:var(--accent-subtle);}
@@ -616,7 +624,7 @@ const CFG = {
 const MODELCAT = [
   {
     id:'qwen2.5-0.5b', name:'Qwen 2.5 · 0.5B',
-    repo:'bartowski/Qwen2.5-0.5B-Instruct-GGUF', file:'Qwen2.5-0.5B-Instruct-Q4_K_M.gguf',
+    repo:'Qwen/Qwen2.5-0.5B-Instruct-GGUF', file:'qwen2.5-0.5b-instruct-q4_k_m.gguf',
     dl:'~400 MB', ram:'~0.7 GB', speed:'fastest', maxTier:'universal', tier:'light', reasoning:false,
     pros:'Smallest and fastest · runs on any device · light on battery',
     cons:'Basic synthesis — best for direct, single-source questions',
@@ -644,7 +652,7 @@ const MODELCAT = [
   },
   {
     id:'qwen2.5-3b', name:'Qwen 2.5 · 3B',
-    repo:'bartowski/Qwen2.5-3B-Instruct-GGUF', file:'Qwen2.5-3B-Instruct-Q4_K_M.gguf',
+    repo:'Qwen/Qwen2.5-3B-Instruct-GGUF', file:'qwen2.5-3b-instruct-q4_k_m.gguf',
     dl:'~1.9 GB', ram:'~3.0 GB', speed:'slow', maxTier:'mid', tier:'balanced', reasoning:false,
     pros:'Strong multi-source synthesis · good at structured contract language',
     cons:'Large download · slow on phones — better on tablets and desktops',
@@ -1130,12 +1138,40 @@ const LLM = {
     this._w = null; ST.llm = null; ST.llmReady = false;
   },
 
+  // Resolve the actual GGUF filename from the HF repo. Publishers name files
+  // inconsistently (case, dots vs underscores), so instead of hard-coding a
+  // guess we list the repo and pick the best match. Result is cached.
+  async resolveFile(repo, preferred){
+    const ck = 'dqa.file.'+repo;
+    const cached = localStorage.getItem(ck);
+    if(cached) return cached;
+    const r = await fetch(`https://huggingface.co/api/models/${repo}`);
+    if(!r.ok) throw new Error(`Repo not found: ${repo}`);
+    const j = await r.json();
+    let files = (j.siblings||[]).map(s=>s.rfilename).filter(f=>/\.gguf$/i.test(f));
+    if(!files.length) throw new Error(`No GGUF files in ${repo}`);
+    // Multi-part models: only the first shard is passed to wllama.
+    const shards = files.filter(f=>/-00001-of-\d+\.gguf$/i.test(f));
+    const singles = files.filter(f=>!/-\d{5}-of-\d+\.gguf$/i.test(f));
+    const pool = singles.length ? singles : shards;
+    const want = (preferred||'').toLowerCase();
+    const pick =
+      pool.find(f=>f.toLowerCase()===want) ||
+      pool.find(f=>/q4_k_m/i.test(f)) ||
+      pool.find(f=>/q4_k/i.test(f))   ||
+      pool.find(f=>/q4/i.test(f))     ||
+      pool[0];
+    localStorage.setItem(ck, pick);
+    return pick;
+  },
+
   async load(onProgress){
     await this.unload();
     const { Wllama } = await import(WLLAMA_ESM);
     this._w = new Wllama(WLLAMA_WASM, { parallelDownloads: 3 });
 
     const m = MODELCAT.find(x=>x.id===CFG.LLM_MODEL) || MODELCAT[0];
+    const file = await this.resolveFile(m.repo, m.file);
     // GPU offload is opt-in. NOTE: llama.cpp's WebGPU backend is a different
     // implementation from MLC/WebLLM's, which is what failed previously — so
     // it is worth trying. Falls back to CPU automatically if it errors.
@@ -1149,12 +1185,12 @@ const LLM = {
         onProgress && onProgress(total ? Math.round(loaded/total*100) : 0),
     };
     try{
-      await this._w.loadModelFromHF({ repo:m.repo, file:m.file }, cfg);
+      await this._w.loadModelFromHF({ repo:m.repo, file }, cfg);
     }catch(e){
       if(gpuLayers > 0){
         console.warn('[DocQA] GPU offload failed, falling back to CPU:', e);
         this.setGpuLayers(0);
-        await this._w.loadModelFromHF({ repo:m.repo, file:m.file }, {...cfg, n_gpu_layers:0});
+        await this._w.loadModelFromHF({ repo:m.repo, file }, {...cfg, n_gpu_layers:0});
       } else throw e;
     }
     ST.llm = this._w; ST.llmReady = true;
@@ -1383,26 +1419,66 @@ const CONTEXT = {
 // ================================================================
 // FEEDBACK — query log; no document text stored
 // ================================================================
+// Issue categories the user can tag. These let the curator tell retrieval
+// failures apart from synthesis failures without reading every case.
+const ISSUE_TAGS = [
+  { id:'missing',    label:'Missing info',    hint:'Left out something important' },
+  { id:'wrong',      label:'Wrong info',      hint:'Stated something incorrect' },
+  { id:'sources',    label:'Wrong sources',   hint:'Pulled the wrong passages' },
+  { id:'incomplete', label:'Too shallow',     hint:'Right idea, not enough detail' },
+  { id:'wording',    label:'Confusing',       hint:'Correct but hard to follow' },
+];
+
 const FEEDBACK = {
   async log(query,chunks,answer,llmUsed){
     const entry={
       id:`fb_${Date.now()}_${Math.random().toString(36).slice(2,5)}`,
       ts:Date.now(), query,
       chunkIds:chunks.map(c=>c.id),
-      sources:chunks.map(c=>({docName:c.docName,page:c.page})),
+      sources:chunks.map(c=>({id:c.id,docName:c.docName,page:c.page})),
       answer, llmUsed, rating:null,
+      model:   CFG.LLM_MODEL,
+      profile: LLM.profile ? LLM.profile() : null,
+      thinking: !!ST.thinking,
+      issues: [],            // tag ids from ISSUE_TAGS
+      sourceRatings: {},     // chunkId -> 'up' | 'down'
+      correctedAnswer: null, // user's edit of the model's answer
     };
     await DB.put('feedback',entry);
     UI.refreshFeedbackDetail();
     return entry.id;
   },
 
-  async rate(id,rating){
+  async _update(id, fn){
     const all=await DB.getAll('feedback');
     const entry=all.find(f=>f.id===id);
-    if(!entry) return;
-    entry.rating=rating;
+    if(!entry) return null;
+    fn(entry);
     await DB.put('feedback',entry);
+    return entry;
+  },
+
+  async rate(id,rating){ return this._update(id, e=>{ e.rating=rating; }); },
+
+  // Mark one retrieved passage as relevant or off-topic.
+  async rateSource(id, chunkId, val){
+    return this._update(id, e=>{
+      e.sourceRatings = e.sourceRatings || {};
+      if(e.sourceRatings[chunkId]===val) delete e.sourceRatings[chunkId];
+      else e.sourceRatings[chunkId]=val;
+    });
+  },
+
+  async toggleIssue(id, tag){
+    return this._update(id, e=>{
+      e.issues = e.issues || [];
+      const i = e.issues.indexOf(tag);
+      if(i>=0) e.issues.splice(i,1); else e.issues.push(tag);
+    });
+  },
+
+  async setCorrection(id, text){
+    return this._update(id, e=>{ e.correctedAnswer = text; });
   },
 
   async exportJSON(){
@@ -1546,22 +1622,43 @@ const UI = {
         <div class="dqa-think-text">${reasoning.replace(/</g,'&lt;')}</div>
       </details>` : '';
 
+    // Each source carries its own relevance markers so the curator can tell
+    // a retrieval problem (wrong passages) from a synthesis problem.
+    const srcRate = c => feedbackId ? `
+      <div class="dqa-src-rate" onclick="event.stopPropagation()">
+        <button class="dqa-src-btn" data-fb="${feedbackId}" data-cid="${c.id}" data-val="up"
+          onclick="window._DQA.rateSource('${feedbackId}','${c.id}','up',this)">✓ Useful</button>
+        <button class="dqa-src-btn" data-fb="${feedbackId}" data-cid="${c.id}" data-val="down"
+          onclick="window._DQA.rateSource('${feedbackId}','${c.id}','down',this)">✕ Off-topic</button>
+      </div>` : '';
+
     const citHtml=chunks.map(c=>`<div class="dqa-citation" onclick="window._DQA.openContext('${c.id}')" role="button" tabindex="0">
       <div class="dqa-citation-source">📄 ${c.docName} — p.${c.page}</div>
       <div class="dqa-citation-quote">${c.text.replace(/\s+/g,' ').slice(0,160)}…</div>
       <div class="dqa-citation-tap">Tap to read more ›</div>
+      ${srcRate(c)}
     </div>`).join('');
+
+    const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const chips = ISSUE_TAGS.map(t=>
+      `<button class="dqa-issue-chip" title="${t.hint}"
+        onclick="window._DQA.toggleIssue('${feedbackId}','${t.id}',this)">${t.label}</button>`).join('');
+
     const rateHtml=feedbackId?`
       <div class="dqa-rating-row">
         <span class="dqa-rate-label">Helpful?</span>
         <button class="dqa-rate-btn up" onclick="window._DQA.rate('${feedbackId}','up',this)">👍</button>
         <button class="dqa-rate-btn down" onclick="window._DQA.rate('${feedbackId}','down',this)">👎</button>
       </div>
-      <div id="dqa-suggest-${feedbackId}" style="display:none;margin-top:6px">
+      <div id="dqa-suggest-${feedbackId}" style="display:none;margin-top:8px">
+        <div class="dqa-fb-label">What went wrong? <span class="dqa-think-hint">(tap any that apply)</span></div>
+        <div class="dqa-issue-chips">${chips}</div>
+        <div class="dqa-fb-label" style="margin-top:10px">Fix the answer <span class="dqa-think-hint">— edit what's wrong, keep what's right</span></div>
         <textarea class="dqa-curator-textarea" id="dqa-sug-ta-${feedbackId}"
-          placeholder="Know a better answer? Suggest it for curator review…" style="min-height:80px"></textarea>
-        <button class="dqa-btn dqa-btn-secondary dqa-btn-sm" style="margin-top:6px"
-          onclick="window._DQA.suggestAnswer('${feedbackId}')">Submit suggestion</button>
+          style="min-height:120px">${esc(summary)}</textarea>
+        <div class="dqa-think-hint" style="margin:4px 0 6px">Also mark any off-topic passages above — that tells the curator whether search or wording was the problem.</div>
+        <button class="dqa-btn dqa-btn-primary dqa-btn-sm"
+          onclick="window._DQA.suggestAnswer('${feedbackId}')">Submit correction</button>
       </div>`:'';
     return `<div class="dqa-bubble">
       <div class="dqa-mode-tag">${modeTag}</div>
@@ -2318,19 +2415,42 @@ async function init(){
       UI._renderPending();
     },
 
-    // User submits a suggested answer (saves as pending)
+    // Mark an individual retrieved passage as useful or off-topic
+    rateSource: async (feedbackId, chunkId, val, btn)=>{
+      await FEEDBACK.rateSource(feedbackId, chunkId, val);
+      const row = btn.parentElement;
+      const was = btn.classList.contains('active');
+      row.querySelectorAll('.dqa-src-btn').forEach(b=>b.classList.remove('active'));
+      btn.classList.add(val);          // ensure colour class present
+      if(!was) btn.classList.add('active');
+      UI.refreshFeedbackDetail();
+    },
+
+    toggleIssue: async (feedbackId, tag, btn)=>{
+      await FEEDBACK.toggleIssue(feedbackId, tag);
+      btn.classList.toggle('active');
+    },
+
+    // Submit a correction: stores the edited answer, the issue tags and the
+    // per-source markers, and queues the correction for curator review.
     suggestAnswer: async feedbackId=>{
       const ta = document.getElementById(`dqa-sug-ta-${feedbackId}`);
       const answer = ta?.value?.trim();
       if(!answer) return;
-      if(!ST.embedReady){alert('Load the embedding model first.');return;}
+      if(!ST.embedReady){
+        UI.appendMsg('ai','<div class="dqa-bubble"><div class="dqa-summary">Load the embedding model first (Models tab).</div></div>');
+        return;
+      }
       const all   = await DB.getAll('feedback');
       const entry = all.find(f=>f.id===feedbackId);
       if(!entry) return;
-      await GOLDEN.add(entry.query, answer, 'pending', feedbackId);
-      ta.value='';
-      document.getElementById(`dqa-suggest-${feedbackId}`).style.display='none';
-      alert('Suggestion submitted for curator review. Thank you!');
+      await FEEDBACK.setCorrection(feedbackId, answer);
+      // Only queue a golden pair if the user actually changed the answer.
+      const changed = (entry.answer||'').trim() !== answer;
+      if(changed) await GOLDEN.add(entry.query, answer, 'pending', feedbackId);
+      const box = document.getElementById(`dqa-suggest-${feedbackId}`);
+      if(box) box.innerHTML = `<div class="dqa-alert info" style="margin:0">✓ Correction saved${changed?' and queued for curator review':''}. Include it via Export Feedback.</div>`;
+      UI.refreshFeedbackDetail();
     },
 
     rate: async(id,rating,btn)=>{
