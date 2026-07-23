@@ -1040,8 +1040,11 @@ const GOLDEN = {
 // Model files are cached by wllama automatically (Cache API), so a
 // model is downloaded once and reloaded from disk in later sessions.
 // ================================================================
-const WLLAMA_ESM  = 'https://cdn.jsdelivr.net/npm/@wllama/wllama@3/esm/index.js';
-const WLLAMA_WASM = 'https://cdn.jsdelivr.net/npm/@wllama/wllama@3/esm/wasm-from-cdn.js';
+// The published package ships wasm-from-cdn.d.ts but NOT the matching .js,
+// so importing it 404s. The generated source shows its shape, so we inline it.
+const WLLAMA_VER  = '3.5.1';
+const WLLAMA_ESM  = `https://cdn.jsdelivr.net/npm/@wllama/wllama@${WLLAMA_VER}/esm/index.js`;
+const WLLAMA_WASM = { default: `https://cdn.jsdelivr.net/npm/@wllama/wllama@${WLLAMA_VER}/src/wasm/wllama.wasm` };
 
 const LLM = {
   _w: null,
@@ -1092,9 +1095,8 @@ const LLM = {
 
   async load(onProgress){
     await this.unload();
-    const [mod, wasm] = await Promise.all([ import(WLLAMA_ESM), import(WLLAMA_WASM) ]);
-    const { Wllama } = mod;
-    this._w = new Wllama(wasm.default, { parallelDownloads: 3 });
+    const { Wllama } = await import(WLLAMA_ESM);
+    this._w = new Wllama(WLLAMA_WASM, { parallelDownloads: 3 });
 
     const m = MODELCAT.find(x=>x.id===CFG.LLM_MODEL) || MODELCAT[0];
     await this._w.loadModelFromHF({ repo:m.repo, file:m.file }, {
@@ -1895,6 +1897,8 @@ const UI = {
     if(bar) bar.style.display='block';
     try{
       await LLM.load(p=>{ if(fill) fill.style.width=p+'%'; });
+      const info=document.getElementById('dqa-device-info');
+      if(info) info.textContent=`Device: ${LLM.device.label} — models beyond this device's capability are disabled.`;
       this.renderModelPicker();
       this.refreshModelStatus();
     }catch(err){
