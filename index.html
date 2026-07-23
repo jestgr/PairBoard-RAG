@@ -168,6 +168,20 @@ textarea{font-family:var(--font-ui);}
 .dqa-model-status{font-size:var(--text-caption);padding:5px var(--s-4);text-align:center;flex-shrink:0;cursor:pointer;border-top:1px solid var(--border-subtle);}
 .dqa-model-status.ready{background:var(--success-bg);color:var(--success);}
 .dqa-model-status.retrieval{background:var(--bg-subtle);color:var(--text-tertiary);}
+/* Thinking toggle */
+.dqa-think-toggle{padding:6px var(--s-4);background:var(--bg-surface);border-top:1px solid var(--border-subtle);flex-shrink:0;}
+.dqa-think-label{display:flex;align-items:center;justify-content:space-between;gap:var(--s-2);font-size:var(--text-footnote);color:var(--text-secondary);cursor:pointer;}
+.dqa-think-hint{color:var(--text-quaternary);font-size:var(--text-caption);}
+.dqa-think-label input{position:absolute;opacity:0;pointer-events:none;}
+.dqa-think-switch{width:38px;height:22px;border-radius:var(--r-full);background:var(--border-default);position:relative;transition:background var(--dur-fast);flex-shrink:0;}
+.dqa-think-switch::after{content:'';position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:#fff;transition:transform var(--dur-fast);box-shadow:var(--shadow-sm);}
+.dqa-think-label input:checked ~ .dqa-think-switch{background:var(--accent);}
+.dqa-think-label input:checked ~ .dqa-think-switch::after{transform:translateX(16px);}
+/* Reasoning block in answers */
+.dqa-think-block{margin:var(--s-2) 0;border:1px solid var(--border-subtle);border-radius:var(--r-lg);background:var(--bg-subtle);overflow:hidden;}
+.dqa-think-block summary{padding:var(--s-2) var(--s-3);font-size:var(--text-caption);font-weight:600;color:var(--accent);cursor:pointer;list-style:none;}
+.dqa-think-block summary::-webkit-details-marker{display:none;}
+.dqa-think-text{padding:0 var(--s-3) var(--s-3);font-size:var(--text-footnote);color:var(--text-tertiary);line-height:1.55;white-space:pre-wrap;font-family:var(--font-mono);}
 .dqa-textarea{flex:1;resize:none;border:1px solid var(--border-default);border-radius:var(--r-2xl);padding:10px var(--s-4);background:var(--bg-app);color:var(--text-primary);font-size:var(--text-base);line-height:1.4;outline:none;max-height:120px;min-height:42px;transition:border-color var(--dur-fast) var(--ease-out);}
 .dqa-textarea:focus{border-color:var(--accent);}
 .dqa-textarea::placeholder{color:var(--text-quaternary);}
@@ -359,6 +373,13 @@ textarea{font-family:var(--font-ui);}
       </div>
     </div>
     <div class="dqa-model-status" id="dqa-model-status" onclick="window._DQA.gotoModels()"></div>
+    <div class="dqa-think-toggle" id="dqa-think-toggle" style="display:none">
+      <label class="dqa-think-label">
+        <span>🧠 Thinking mode <span class="dqa-think-hint">— deeper reasoning, slower</span></span>
+        <input type="checkbox" id="dqa-think-check" onchange="window._DQA.toggleThinking(this.checked)">
+        <span class="dqa-think-switch"></span>
+      </label>
+    </div>
     <div class="dqa-input-row">
       <textarea class="dqa-textarea" id="dqa-input" placeholder="Ask a question…" rows="1"></textarea>
       <button class="dqa-send" id="dqa-send" disabled>
@@ -531,64 +552,84 @@ const CFG = {
   CHUNK_OVERLAP:     50,
   INGEST_BATCH:      20,
   TOP_K:             12,    // passages retrieved & shown as sources
-  LLM_CONTEXT_K:     3,     // passages fed to LLM — small KV-cache buffer (Mali-safe)
-  MAX_TOKENS:        512,   // smaller output buffer; reduces GPU allocation pressure
+  LLM_CONTEXT_K:     6,     // chunks fed to LLM in normal mode (was 3)
+  LLM_CONTEXT_K_THINK: 3,   // fewer chunks when thinking mode is on (reasoning needs token room)
+  CHUNK_WORD_CAP:    180,   // words per chunk fed to LLM (context-window budget)
+  MAX_TOKENS:        800,   // normal answer budget
+  MAX_TOKENS_THINK:  1400,  // larger when thinking (reasoning block + answer)
   GOLDEN_THRESHOLD:  0.82,  // cosine similarity to trigger golden pair injection
   EMBED_MODEL:       'Xenova/all-MiniLM-L6-v2',
-  LLM_MODEL:         'Llama-3.2-1B-Instruct-q4f32_1-MLC', // overridden by saved picker choice
+  LLM_MODEL:         'Llama-3.2-1B-Instruct-q4f16_1-MLC', // overridden by saved picker choice
   DB_NAME:           'dqa_v1',
   DB_VER:            4,     // v4: added golden pairs store
   KB_SCHEMA_VER:     '1',
-  MODEL_PREF_KEY:    'dqa.model',   // localStorage key for picker selection
+  MODEL_PREF_KEY:    'dqa.model',    // localStorage key for picker selection
+  THINK_PREF_KEY:    'dqa.thinking', // localStorage key for thinking toggle
 };
 
 // ================================================================
-// MODELCAT — selectable LLM catalog
-// q4f16 variants (require shader-f16). The WebGPU diagnostic confirmed
-// shader-f16 support + working q4f16 inference on target devices. The
-// app falls back to retrieval-only where WebGPU/shader-f16 is absent.
+// MODELCAT — selectable LLM catalog (all q4f16_1 — need shader-f16)
+// `reasoning:true` marks Qwen3 models that support thinking mode.
 // maxTier gates compatibility against detected device tier.
 // ================================================================
 const MODELCAT = [
   {
     id:   'Qwen2.5-0.5B-Instruct-q4f16_1-MLC',
-    name: 'Qwen 2.5 · 0.5B', dl:'~350 MB', maxTier:'universal', tier:'light',
-    pros: 'Smallest & fastest · proven to run on mobile WebGPU',
+    name: 'Qwen 2.5 · 0.5B', dl:'~350 MB', maxTier:'universal', tier:'light', reasoning:false,
+    pros: 'Smallest & fastest · proven on mobile WebGPU',
     cons: 'Most basic synthesis — best for simple, direct questions',
   },
   {
+    id:   'Qwen3-0.6B-q4f16_1-MLC',
+    name: 'Qwen 3 · 0.6B', dl:'~400 MB', maxTier:'universal', tier:'light', reasoning:true,
+    pros: 'Tiny + optional thinking mode for step-by-step reasoning',
+    cons: 'Small model — thinking helps but depth is limited',
+  },
+  {
     id:   'Llama-3.2-1B-Instruct-q4f16_1-MLC',
-    name: 'Llama 3.2 · 1B', dl:'~700 MB', maxTier:'universal', tier:'light',
+    name: 'Llama 3.2 · 1B', dl:'~700 MB', maxTier:'universal', tier:'light', reasoning:false,
     pros: 'Fast · small download · solid for everyday lookups',
     cons: 'May miss nuance on complex multi-source questions',
   },
   {
+    id:   'Qwen3-1.7B-q4f16_1-MLC',
+    name: 'Qwen 3 · 1.7B', dl:'~1.1 GB', maxTier:'universal', tier:'balanced', reasoning:true,
+    pros: 'Best balance — strong reasoning + thinking mode · phone-friendly',
+    cons: 'Thinking mode is slower · uses more context',
+  },
+  {
     id:   'Llama-3.2-3B-Instruct-q4f16_1-MLC',
-    name: 'Llama 3.2 · 3B', dl:'~1.7 GB', maxTier:'universal', tier:'balanced',
+    name: 'Llama 3.2 · 3B', dl:'~1.7 GB', maxTier:'universal', tier:'balanced', reasoning:false,
     pros: 'Solid multi-source synthesis · good speed on modern phones',
     cons: 'Larger download · slower than 1B on older devices',
   },
   {
     id:   'Hermes-3-Llama-3.2-3B-q4f16_1-MLC',
-    name: 'Hermes 3 · 3B', dl:'~1.7 GB', maxTier:'universal', tier:'balanced',
+    name: 'Hermes 3 · 3B', dl:'~1.7 GB', maxTier:'universal', tier:'balanced', reasoning:false,
     pros: 'Tuned for structured formats — best citation reliability at this size',
     cons: 'Same hardware needs as Llama 3B',
   },
   {
+    id:   'Qwen3-4B-q4f16_1-MLC',
+    name: 'Qwen 3 · 4B', dl:'~2.4 GB', maxTier:'standard', tier:'best', reasoning:true,
+    pros: 'Best reasoning available on-device · thinking mode for complex rules',
+    cons: 'Flagship phone / tablet / desktop only · big download',
+  },
+  {
     id:   'Phi-3.5-mini-instruct-q4f16_1-MLC',
-    name: 'Phi 3.5 Mini · 3.8B', dl:'~2.2 GB', maxTier:'standard', tier:'best',
-    pros: 'Strong reasoning on regulatory text · excellent instruction following',
+    name: 'Phi 3.5 Mini · 3.8B', dl:'~2.2 GB', maxTier:'standard', tier:'best', reasoning:false,
+    pros: 'Strong on regulatory text · excellent instruction following',
     cons: 'Needs flagship phone or desktop · big download',
   },
   {
     id:   'Mistral-7B-Instruct-v0.3-q4f16_1-MLC',
-    name: 'Mistral · 7B', dl:'~4.0 GB', maxTier:'desktop', tier:'best',
-    pros: 'Near-desktop quality synthesis · handles dense multi-document context',
+    name: 'Mistral · 7B', dl:'~4.0 GB', maxTier:'desktop', tier:'best', reasoning:false,
+    pros: 'Near-desktop quality · handles dense multi-document context',
     cons: 'Desktop / M-series Mac only · long first download',
   },
   {
     id:   'Llama-3.1-8B-Instruct-q4f16_1-MLC',
-    name: 'Llama 3.1 · 8B', dl:'~4.6 GB', maxTier:'desktop', tier:'best',
+    name: 'Llama 3.1 · 8B', dl:'~4.6 GB', maxTier:'desktop', tier:'best', reasoning:false,
     pros: 'Best available quality — thorough answers, best edge-case coverage',
     cons: 'Desktop-class GPU required · largest download',
   },
@@ -601,6 +642,7 @@ const ST = {
   docs: [], chunks: [],
   embedder:null, llm:null,
   llmReady:false, embedReady:false, webgpuOk:false, busy:false,
+  thinking: false,   // user toggle for Qwen3 thinking mode
 };
 
 // ================================================================
@@ -672,7 +714,10 @@ const DB = (() => {
 })();
 
 // ================================================================
-// EMBED — transformers.js WASM (universal, no WebGPU)
+// EMBED — transformers.js, forced to WASM/CPU (never WebGPU)
+// CRITICAL: if the embedder uses WebGPU it contends with WebLLM for the GPU
+// context and unmaps WebLLM's buffers mid-inference → 'mapAsync' crash.
+// Forcing WASM keeps embedding on CPU and leaves the GPU solely to WebLLM.
 // ================================================================
 const EMBED = {
   async load(onProgress) {
@@ -680,7 +725,14 @@ const EMBED = {
       'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2/dist/transformers.min.js'
     );
     env.allowLocalModels = false;
+    // Pin execution to WASM; disable any WebGPU/WebNN backend auto-selection.
+    env.backends.onnx.wasm.numThreads = 1;
+    if(env.backends?.onnx) {
+      // Prevent transformers.js from choosing a GPU execution provider.
+      env.useBrowserCache = true;
+    }
     ST.embedder = await pipeline('feature-extraction', CFG.EMBED_MODEL, {
+      device: 'wasm',                 // explicit WASM — do not touch the GPU
       progress_callback: p => { if(p.status==='progress'&&onProgress) onProgress(Math.round(p.progress??0)); }
     });
     ST.embedReady = true;
@@ -1023,7 +1075,18 @@ const LLM = {
     UI.refreshModelStatus();
   },
 
-  buildMessages(query,chunks){
+  // Is the current model reasoning-capable (Qwen3)?
+  currentIsReasoning(){
+    const m = MODELCAT.find(x=>x.id===CFG.LLM_MODEL);
+    return !!(m && m.reasoning);
+  },
+
+  // Is thinking mode both available (Qwen3) AND enabled by the user?
+  thinkingActive(){
+    return this.currentIsReasoning() && ST.thinking;
+  },
+
+  buildMessages(query,chunks,thinking){
     const curatorChunk   = chunks.find(c=>c.isGolden&&c.authority==='curator');
     const communityChunk = chunks.find(c=>c.isGolden&&c.authority==='approved');
     const passages = chunks.map((c,i)=>{
@@ -1040,48 +1103,71 @@ const LLM = {
       ? 'The passage marked [COMMUNITY ANSWER] has been reviewed and approved — use it as helpful context but verify against the other source passages.'
       : '';
 
+    // In thinking mode, ask for reasoning through interactions; the model emits
+    // its own <think> block, so we don't request one in the format.
+    const thinkNote = thinking
+      ? ' Reason step by step through how the rules interact before answering, considering edge cases and how multiple provisions combine.'
+      : '';
+
     return [
       {role:'system', content:
-        'You are an aviation reference assistant with deep knowledge of FARs, airline contracts, and operational procedures. ' +
-        goldenNote +
-        ' Answer using ONLY the source passages provided. ' +
-        'Provide a thorough, complete answer covering all relevant aspects and edge cases found in the passages — do not truncate or oversimplify. ' +
-        'If passages contain partial or related information, include it even if not a direct answer. ' +
-        'After your answer, list each source cited with a short direct quote (under 20 words). ' +
-        'If passages do not fully answer the question, explicitly state what is missing. ' +
-        'Format:\nAnswer: [full answer]\n\nCitations:\n• [Source — Page N] — "direct quote"'},
+        'You are an aviation reference assistant with deep knowledge of FARs, airline contracts, and operational procedures.' +
+        (goldenNote?' '+goldenNote:'') +
+        ' Answer using ONLY the source passages provided.' +
+        thinkNote +
+        ' Provide a thorough, complete answer covering all relevant aspects and edge cases found in the passages — do not oversimplify.' +
+        ' If passages contain partial or related information, include it even if not a direct answer.' +
+        ' After your answer, list each source cited with a short direct quote (under 20 words).' +
+        ' If passages do not fully answer the question, explicitly state what is missing.' +
+        ' Format:\nAnswer: [full answer]\n\nCitations:\n• [Source — Page N] — "direct quote"'},
       {role:'user', content:`SOURCE PASSAGES:\n\n${passages}\n\nQUESTION: ${query}`}
     ];
   },
 
   async synthesize(query,chunks){
-    // No reload-on-error: re-initializing WebLLM while the first engine's GPU
-    // buffers are in flight unmaps them mid-operation and CAUSES the
-    // 'mapAsync unmapped' error. Let the call succeed or fail cleanly.
     return await this._call(query,chunks);
   },
 
   async _call(query,chunks){
-    // Feed only top LLM_CONTEXT_K chunks, each truncated, to keep the prompt
-    // (and GPU KV-cache buffer) small. Large prompts trigger the 'mapAsync
-    // unmapped' buffer race on some mobile GPUs (Mali).
-    const ctx = chunks.slice(0, CFG.LLM_CONTEXT_K).map(c=>({
+    const thinking = this.thinkingActive();
+    const k        = thinking ? CFG.LLM_CONTEXT_K_THINK : CFG.LLM_CONTEXT_K;
+    const maxTok   = thinking ? CFG.MAX_TOKENS_THINK : CFG.MAX_TOKENS;
+
+    // Feed top-k chunks, each word-capped, to fit the 4k context window.
+    const ctx = chunks.slice(0, k).map(c=>({
       ...c,
-      text: c.text.split(/\s+/).slice(0, 120).join(' ')
+      text: c.text.split(/\s+/).slice(0, CFG.CHUNK_WORD_CAP).join(' ')
     }));
-    // Streaming mode allocates the KV-cache incrementally rather than in one
-    // large up-front buffer — markedly more stable on mobile WebGPU.
-    const stream = await ST.llm.chat.completions.create({
-      messages: this.buildMessages(query, ctx),
-      temperature: 0.2,
-      max_tokens: CFG.MAX_TOKENS,
+
+    const opts = {
+      messages: this.buildMessages(query, ctx, thinking),
+      temperature: thinking ? 0.6 : 0.2,   // Qwen3 thinking prefers ~0.6
+      max_tokens: maxTok,
       stream: true,
-    });
+    };
+    // Qwen3 enable_thinking flag — passed through to the chat template.
+    if(this.currentIsReasoning()){
+      opts.extra_body = { enable_thinking: thinking };
+    }
+
+    // Streaming allocates the KV-cache incrementally — more stable on mobile.
+    const stream = await ST.llm.chat.completions.create(opts);
     let out = '';
     for await (const chunk of stream){
       out += chunk.choices[0]?.delta?.content || '';
     }
     return out;
+  },
+
+  // Strip the <think>...</think> reasoning block from Qwen3 output, returning
+  // both the visible answer and the hidden reasoning (for optional display).
+  splitThinking(raw){
+    const m = raw.match(/<think>([\s\S]*?)<\/think>/);
+    if(!m) return { answer: raw.trim(), reasoning: null };
+    return {
+      answer: raw.replace(/<think>[\s\S]*?<\/think>/,'').trim(),
+      reasoning: m[1].trim(),
+    };
   }
 };
 
@@ -1341,12 +1427,29 @@ const UI = {
   setThinkLabel(t){const el=document.getElementById('dqa-think-lbl');if(el)el.textContent=t;},
 
   renderAnswer(rawText,chunks,llmUsed,feedbackId){
-    const modeTag=llmUsed?`✦ Llama · ${chunks.length} sources`:`⚡ Retrieval-only · ${chunks.length} sources`;
-    let summary=rawText;
-    if(rawText.includes('Answer:'))
-      summary=rawText.split('Answer:')[1].split(/Citations:|•/)[0].trim();
-    else if(rawText.includes('Summary:'))
-      summary=rawText.split('Summary:')[1].split(/Citations:|•/)[0].trim();
+    const model = MODELCAT.find(m=>m.id===CFG.LLM_MODEL);
+    const modelName = model?model.name:'Model';
+
+    // Split out Qwen3 <think> reasoning if present
+    const { answer, reasoning } = LLM.splitThinking(rawText);
+
+    const modeTag = llmUsed
+      ? `✦ ${modelName}${reasoning?' · 🧠 reasoned':''} · ${chunks.length} sources`
+      : `⚡ Retrieval-only · ${chunks.length} sources`;
+
+    let summary=answer;
+    if(answer.includes('Answer:'))
+      summary=answer.split('Answer:')[1].split(/Citations:|•/)[0].trim();
+    else if(answer.includes('Summary:'))
+      summary=answer.split('Summary:')[1].split(/Citations:|•/)[0].trim();
+
+    // Collapsible reasoning block (thinking mode only)
+    const thinkHtml = reasoning ? `
+      <details class="dqa-think-block">
+        <summary>🧠 Show reasoning</summary>
+        <div class="dqa-think-text">${reasoning.replace(/</g,'&lt;')}</div>
+      </details>` : '';
+
     const citHtml=chunks.map(c=>`<div class="dqa-citation" onclick="window._DQA.openContext('${c.id}')" role="button" tabindex="0">
       <div class="dqa-citation-source">📄 ${c.docName} — p.${c.page}</div>
       <div class="dqa-citation-quote">${c.text.replace(/\s+/g,' ').slice(0,160)}…</div>
@@ -1367,6 +1470,7 @@ const UI = {
     return `<div class="dqa-bubble">
       <div class="dqa-mode-tag">${modeTag}</div>
       <div class="dqa-summary">${summary}</div>
+      ${thinkHtml}
       <div class="dqa-citations-label">Sources</div>
       <div class="dqa-citations">${citHtml}</div>
       ${rateHtml}
@@ -1408,6 +1512,9 @@ const UI = {
       let rawAnswer,llmUsed=false;
       if(LLM.isLoaded()){
         this.setThinkLabel('Synthesizing answer…');
+        // Let any pending GPU/WASM work from retrieval fully settle before
+        // handing the GPU to WebLLM — avoids buffer contention.
+        await new Promise(r=>setTimeout(r,150));
         rawAnswer=await LLM.synthesize(query,chunks);
         llmUsed=true;
       }
@@ -1472,9 +1579,7 @@ const UI = {
     if(!ST.webgpuOk){
       el.className='dqa-model-status retrieval';
       el.textContent='⚡ Retrieval-only · this device has no WebGPU';
-      return;
-    }
-    if(LLM.isLoaded()){
+    } else if(LLM.isLoaded()){
       const m = MODELCAT.find(x=>x.id===CFG.LLM_MODEL);
       el.className='dqa-model-status ready';
       el.textContent=`✦ ${m?m.name:'Model'} loaded · full synthesis active`;
@@ -1482,6 +1587,16 @@ const UI = {
       const m = MODELCAT.find(x=>x.id===CFG.LLM_MODEL);
       el.className='dqa-model-status retrieval';
       el.textContent=`⚡ Retrieval-only · tap to load ${m?m.name:'a model'} for synthesis`;
+    }
+    // Thinking toggle: visible only for reasoning-capable models that are loaded
+    const tog = document.getElementById('dqa-think-toggle');
+    if(tog){
+      const show = LLM.isLoaded() && LLM.currentIsReasoning();
+      tog.style.display = show ? 'block' : 'none';
+      if(show){
+        const chk = document.getElementById('dqa-think-check');
+        if(chk) chk.checked = ST.thinking;
+      }
     }
   },
 
@@ -1873,6 +1988,7 @@ async function init(){
   ST.docs   = await DB.getAll('docs');
   ST.chunks = await DB.getAll('chunks');
   await GOLDEN.load();
+  try{ ST.thinking = localStorage.getItem(CFG.THINK_PREF_KEY)==='1'; }catch{}
 
   UI.initTabs();
   UI.initChatInput();
@@ -1892,6 +2008,10 @@ async function init(){
     discardDoc:   id=>UI.discardDoc(id),
     openContext:  id=>CONTEXT.open(id),
     gotoModels:   ()=>UI.gotoModels(),
+    toggleThinking: on=>{
+      ST.thinking = !!on;
+      try{ localStorage.setItem(CFG.THINK_PREF_KEY, on?'1':'0'); }catch{}
+    },
     switchAndLoad: async id=>{
       const m=MODELCAT.find(x=>x.id===id); if(!m) return;
       CFG.LLM_MODEL=id;
