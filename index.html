@@ -435,6 +435,13 @@ textarea{font-family:var(--font-ui);}
           <div class="dqa-alert warn" id="dqa-webgpu-warn" style="display:none;margin-bottom:8px">⚠ WebGPU unavailable. Retrieval-only mode active — top passages returned without synthesis.</div>
           <div class="dqa-alert info" id="dqa-device-info" style="margin-bottom:8px">Detecting device capability…</div>
           <div id="dqa-model-picker"><!-- model cards rendered by UI.renderModelPicker --></div>
+          <div class="dqa-model-card" id="dqa-selftest-card" style="margin-top:8px">
+            <div class="dqa-model-name">Synthesis self-test</div>
+            <div class="dqa-model-detail">Runs three escalating generations to pinpoint where synthesis fails on this device.</div>
+            <button class="dqa-btn dqa-btn-secondary dqa-btn-sm" id="dqa-selftest-btn"
+              onclick="window._DQA.runSelfTest()">Run self-test</button>
+            <pre id="dqa-selftest-out" style="display:none;font-size:11px;line-height:1.5;white-space:pre-wrap;background:var(--bg-subtle);border-radius:var(--r-lg);padding:8px;margin:0;color:var(--text-secondary)"></pre>
+          </div>
         </div>
 
         <div>
@@ -813,6 +820,7 @@ const INGEST = {
     doc.status='indexed';
     await DB.put('docs',doc);
     ST.chunks.push(...chunks);
+    SEARCH.invalidate();
     onProgress('Done',100,total,total);
     return doc;
   },
@@ -847,6 +855,7 @@ const INGEST = {
     const embeddedMap = Object.fromEntries(pending.map(c=>[c.id,c]));
     ST.chunks = ST.chunks.filter(c=>c.docId!==doc.id);
     ST.chunks.push(...docChunks.map(c=>embeddedMap[c.id]??c));
+    SEARCH.invalidate();
     onProgress('Done',100,total,total);
     return doc;
   }
@@ -856,24 +865,41 @@ const INGEST = {
 // SEARCH — cosine similarity in a Web Worker (off main thread)
 // ================================================================
 const SEARCH = (() => {
-  // Worker source as string — runs cosine math off the UI thread
+  // Worker holds the embedding matrix persistently. Main thread sends the
+  // index ONCE (as a transferable Float32Array), then only tiny query vectors.
+  // Previously the entire embedding set was structured-cloned on EVERY query —
+  // a large allocation spike immediately before GPU inference.
   const SRC = `
+    let IDS = null, MAT = null, DIM = 0;
     self.onmessage = function(e) {
-      const {chunks, qvec, k} = e.data;
-      function cosine(a,b){
-        let dot=0,na=0,nb=0;
-        for(let i=0;i<a.length;i++){dot+=a[i]*b[i];na+=a[i]*a[i];nb+=b[i]*b[i];}
-        return dot/(Math.sqrt(na)*Math.sqrt(nb)+1e-10);
+      const msg = e.data;
+      if (msg.type === 'init') {
+        IDS = msg.ids; MAT = new Float32Array(msg.buf); DIM = msg.dim;
+        self.postMessage({type:'ready', n: IDS.length});
+        return;
       }
-      const ids = chunks
-        .map(c=>({id:c.id, s:cosine(qvec,c.embedding)}))
-        .sort((a,b)=>b.s-a.s)
-        .slice(0,k)
-        .map(x=>x.id);
-      self.postMessage(ids);
+      if (msg.type === 'search') {
+        if (!MAT) { self.postMessage({type:'result', ids: []}); return; }
+        const q = msg.qvec, k = msg.k;
+        let qn = 0;
+        for (let i=0;i<DIM;i++) qn += q[i]*q[i];
+        qn = Math.sqrt(qn) + 1e-10;
+        const n = IDS.length;
+        const scores = new Float32Array(n);
+        for (let r=0;r<n;r++){
+          const off = r*DIM;
+          let dot=0, mn=0;
+          for (let i=0;i<DIM;i++){ const v=MAT[off+i]; dot += q[i]*v; mn += v*v; }
+          scores[r] = dot / (Math.sqrt(mn)*qn + 1e-10);
+        }
+        const idx = Array.from({length:n}, (_,i)=>i)
+          .sort((a,b)=>scores[b]-scores[a]).slice(0,k);
+        self.postMessage({type:'result', ids: idx.map(i=>IDS[i])});
+      }
     };
   `;
-  let _worker = null;
+  let _worker = null, _indexed = false;
+
   const getWorker = () => {
     if (!_worker) {
       const blob = new Blob([SRC], {type:'text/javascript'});
@@ -882,31 +908,41 @@ const SEARCH = (() => {
     return _worker;
   };
 
-  return {
-    async retrieve(queryText, k=CFG.TOP_K) {
-      const qvec    = await EMBED.embed(queryText);
-      const indexed = ST.chunks.filter(c=>c.embedding!==null);
+  const buildIndex = () => new Promise((res,rej)=>{
+    const rows = ST.chunks.filter(c=>c.embedding && c.embedding.length);
+    if(!rows.length){ _indexed = false; return res(0); }
+    const dim = rows[0].embedding.length;
+    const mat = new Float32Array(rows.length * dim);
+    const ids = new Array(rows.length);
+    for(let r=0;r<rows.length;r++){
+      ids[r] = rows[r].id;
+      mat.set(rows[r].embedding, r*dim);
+    }
+    const w = getWorker();
+    w.onmessage = e => { if(e.data.type==='ready'){ _indexed = true; res(e.data.n); } };
+    w.onerror   = e => rej(new Error(e.message));
+    // Transfer the buffer — zero-copy; no structured clone of the matrix.
+    w.postMessage({type:'init', ids, buf: mat.buffer, dim}, [mat.buffer]);
+  });
 
-      // Send only id+embedding to worker
+  return {
+    // Call whenever ST.chunks changes (import, delete, KB import)
+    invalidate(){ _indexed = false; },
+
+    async retrieve(queryText, k=CFG.TOP_K) {
+      const qvec = await EMBED.embed(queryText);
+      if(!_indexed) await buildIndex();
+
       const ids = await new Promise((res,rej) => {
         const w = getWorker();
-        w.onmessage = e => res(e.data);
+        w.onmessage = e => { if(e.data.type==='result') res(e.data.ids); };
         w.onerror   = e => rej(new Error(e.message));
-        w.postMessage({ chunks: indexed.map(c=>({id:c.id, embedding:c.embedding})), qvec, k });
+        w.postMessage({type:'search', qvec, k});
       });
 
       const retrieved = ids.map(id => ST.chunks.find(c=>c.id===id)).filter(Boolean);
-
-      // Inject curator/approved golden pair if query matches threshold
       const match = GOLDEN.findInjectMatch(qvec);
-      if (match) {
-        return [GOLDEN.asSyntheticChunk(match.pair), ...retrieved];
-      }
-
-      // No injectable match — check pending pairs for retrieval boosting.
-      // Pending pairs inform which topic area we're in but don't appear in answers.
-      // (Boost is implicit: pending pairs expand the effective query signal;
-      //  future versions can re-rank retrieved chunks using pending answer embeddings.)
+      if (match) return [GOLDEN.asSyntheticChunk(match.pair), ...retrieved];
       return retrieved;
     }
   };
@@ -1143,20 +1179,17 @@ const LLM = {
       messages: this.buildMessages(query, ctx, thinking),
       temperature: thinking ? 0.6 : 0.2,   // Qwen3 thinking prefers ~0.6
       max_tokens: maxTok,
-      stream: true,
     };
     // Qwen3 enable_thinking flag — passed through to the chat template.
     if(this.currentIsReasoning()){
       opts.extra_body = { enable_thinking: thinking };
     }
 
-    // Streaming allocates the KV-cache incrementally — more stable on mobile.
-    const stream = await ST.llm.chat.completions.create(opts);
-    let out = '';
-    for await (const chunk of stream){
-      out += chunk.choices[0]?.delta?.content || '';
-    }
-    return out;
+    // Non-streaming: one readback instead of a mapAsync per token. Streaming
+    // multiplies the number of GPU buffer mappings and with it the chance of
+    // hitting the 'unmapped before mapping resolved' race on mobile GPUs.
+    const resp = await ST.llm.chat.completions.create(opts);
+    return resp.choices[0].message.content;
   },
 
   // Strip the <think>...</think> reasoning block from Qwen3 output, returning
@@ -1363,7 +1396,7 @@ const KB = {
     await DB.putAll('docs',pkg.docs);
     await DB.putAll('chunks',pkg.chunks);
     if(pkg.golden?.length) await DB.putAll('golden',pkg.golden);
-    ST.docs=pkg.docs; ST.chunks=pkg.chunks;
+    ST.docs=pkg.docs; ST.chunks=pkg.chunks; SEARCH.invalidate();
     GOLDEN._pairs = pkg.golden??[];
     return pkg;
   }
@@ -1725,14 +1758,14 @@ const UI = {
     if(!confirm('Discard this interrupted import?')) return;
     await DB.deleteDoc(docId);
     ST.docs=ST.docs.filter(d=>d.id!==docId);
-    ST.chunks=ST.chunks.filter(c=>c.docId!==docId);
+    ST.chunks=ST.chunks.filter(c=>c.docId!==docId); SEARCH.invalidate();
     this.renderDocs();
   },
 
   async removeDoc(docId){
     await DB.deleteDoc(docId);
     ST.docs=ST.docs.filter(d=>d.id!==docId);
-    ST.chunks=ST.chunks.filter(c=>c.docId!==docId);
+    ST.chunks=ST.chunks.filter(c=>c.docId!==docId); SEARCH.invalidate();
     this.renderDocs();
   },
 
@@ -1863,7 +1896,7 @@ const UI = {
     });
     document.getElementById('dqa-kb-clear').addEventListener('click',async()=>{
       if(!confirm('Clear all indexed documents?')) return;
-      await DB.clearAll(); ST.docs=[]; ST.chunks=[]; this.renderDocs();
+      await DB.clearAll(); ST.docs=[]; ST.chunks=[]; SEARCH.invalidate(); this.renderDocs();
     });
   },
 
@@ -2008,6 +2041,59 @@ async function init(){
     discardDoc:   id=>UI.discardDoc(id),
     openContext:  id=>CONTEXT.open(id),
     gotoModels:   ()=>UI.gotoModels(),
+
+    // Escalating synthesis test — isolates which layer breaks generation.
+    runSelfTest: async ()=>{
+      const out = document.getElementById('dqa-selftest-out');
+      const btn = document.getElementById('dqa-selftest-btn');
+      out.style.display='block'; btn.disabled=true; btn.textContent='Running…';
+      const log = t => { out.textContent += t+'\n'; };
+      out.textContent='';
+      if(!LLM.isLoaded()){ log('✗ No model loaded. Load one first.'); btn.disabled=false; btn.textContent='Run self-test'; return; }
+
+      // Test 1 — minimal prompt (mirrors the standalone diagnostic exactly)
+      try{
+        log('1. Minimal prompt (20 tokens)…');
+        const r = await ST.llm.chat.completions.create({
+          messages:[{role:'user',content:'Say hello in 3 words.'}], max_tokens:20 });
+        log('   ✓ PASS — "'+r.choices[0].message.content.trim()+'"');
+      }catch(e){ log('   ✗ FAIL — '+(e.message||e));
+        log('\n→ Generation fails even with a tiny prompt and no retrieval.');
+        log('  The problem is the app environment (PWA/worker/memory), not the prompt.');
+        btn.disabled=false; btn.textContent='Run self-test'; return; }
+
+      // Test 2 — full-size prompt, no retrieval (isolates prompt size)
+      try{
+        log('2. Large prompt, no retrieval ('+CFG.MAX_TOKENS+' tokens)…');
+        const filler = 'The reserve guarantee is calculated as the average line value minus two hours. '.repeat(40);
+        const r = await ST.llm.chat.completions.create({
+          messages:[{role:'system',content:'You are a reference assistant.'},
+                    {role:'user',content:filler+'\n\nQUESTION: Summarize the rule above.'}],
+          max_tokens: CFG.MAX_TOKENS });
+        log('   ✓ PASS — '+r.choices[0].message.content.trim().slice(0,60)+'…');
+      }catch(e){ log('   ✗ FAIL — '+(e.message||e));
+        log('\n→ Small prompts work, large ones do not. Prompt size is the limit;');
+        log('  reduce LLM_CONTEXT_K / MAX_TOKENS.');
+        btn.disabled=false; btn.textContent='Run self-test'; return; }
+
+      // Test 3 — real pipeline: retrieval then synthesis
+      try{
+        log('3. Retrieval + synthesis (real path)…');
+        if(!ST.embedReady){ log('   ⚠ SKIPPED — embedding model not loaded'); }
+        else if(!ST.chunks.filter(c=>c.embedding).length){ log('   ⚠ SKIPPED — no indexed documents'); }
+        else {
+          const chunks = await SEARCH.retrieve('reserve pilot pay');
+          await new Promise(r=>setTimeout(r,150));
+          const txt = await LLM.synthesize('How is a reserve pilot paid?', chunks);
+          log('   ✓ PASS — '+LLM.splitThinking(txt).answer.trim().slice(0,60)+'…');
+          log('\n→ All three passed. Synthesis is working; ask a question in Chat.');
+        }
+      }catch(e){ log('   ✗ FAIL — '+(e.message||e));
+        log('\n→ Isolated generation works, but retrieval+synthesis together fails.');
+        log('  Cause is memory pressure or GPU contention from the retrieval step.'); }
+
+      btn.disabled=false; btn.textContent='Run self-test again';
+    },
     toggleThinking: on=>{
       ST.thinking = !!on;
       try{ localStorage.setItem(CFG.THINK_PREF_KEY, on?'1':'0'); }catch{}
