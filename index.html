@@ -434,14 +434,14 @@ textarea{font-family:var(--font-ui);}
           <div class="dqa-label">Language Model · Answer Synthesis</div>
           <div class="dqa-alert warn" id="dqa-webgpu-warn" style="display:none;margin-bottom:8px">⚠ WebGPU unavailable. Retrieval-only mode active — top passages returned without synthesis.</div>
           <div class="dqa-alert info" id="dqa-device-info" style="margin-bottom:8px">Detecting device capability…</div>
-          <div id="dqa-model-picker"><!-- model cards rendered by UI.renderModelPicker --></div>
-          <div class="dqa-model-card" id="dqa-selftest-card" style="margin-top:8px">
-            <div class="dqa-model-name">Synthesis self-test</div>
-            <div class="dqa-model-detail">Runs three escalating generations to pinpoint where synthesis fails on this device.</div>
-            <button class="dqa-btn dqa-btn-secondary dqa-btn-sm" id="dqa-selftest-btn"
+          <div class="dqa-model-card" id="dqa-selftest-card" style="margin-bottom:12px;border-color:var(--accent-muted)">
+            <div class="dqa-model-name">🔧 Synthesis self-test</div>
+            <div class="dqa-model-detail">Runs three escalating generations to pinpoint exactly where synthesis fails on this device. Load a model first.</div>
+            <button class="dqa-btn dqa-btn-primary dqa-btn-sm" id="dqa-selftest-btn"
               onclick="window._DQA.runSelfTest()">Run self-test</button>
             <pre id="dqa-selftest-out" style="display:none;font-size:11px;line-height:1.5;white-space:pre-wrap;background:var(--bg-subtle);border-radius:var(--r-lg);padding:8px;margin:0;color:var(--text-secondary)"></pre>
           </div>
+          <div id="dqa-model-picker"><!-- model cards rendered by UI.renderModelPicker --></div>
         </div>
 
         <div>
