@@ -1169,15 +1169,36 @@ const LLM = {
     return await this._call(query,chunks);
   },
 
+  // Device input-word ceiling measured by the self-test probe.
+  // 9999 = no ceiling found · 0 = device can't prefill RAG prompts · null = untested
+  wordCap(){
+    const v = localStorage.getItem('dqa.wordcap');
+    return v===null ? null : parseInt(v,10);
+  },
+
   async _call(query,chunks){
     const thinking = this.thinkingActive();
-    const k        = thinking ? CFG.LLM_CONTEXT_K_THINK : CFG.LLM_CONTEXT_K;
+    let   k        = thinking ? CFG.LLM_CONTEXT_K_THINK : CFG.LLM_CONTEXT_K;
     const maxTok   = thinking ? CFG.MAX_TOKENS_THINK : CFG.MAX_TOKENS;
+    let   wordCap  = CFG.CHUNK_WORD_CAP;
 
-    // Feed top-k chunks, each word-capped, to fit the 4k context window.
+    // Fit the prompt under the device's measured prefill ceiling. The system
+    // prompt + question cost ~150 words, so budget the rest for passages.
+    const cap = this.wordCap();
+    if(cap !== null && cap < 9999){
+      const budget = Math.max(80, cap - 150);
+      const perChunk = Math.floor(budget / k);
+      if(perChunk < 60){                       // too tight — drop chunks instead
+        k = Math.max(1, Math.floor(budget / 80));
+        wordCap = Math.max(60, Math.floor(budget / k));
+      } else {
+        wordCap = Math.min(CFG.CHUNK_WORD_CAP, perChunk);
+      }
+    }
+
     const ctx = chunks.slice(0, k).map(c=>({
       ...c,
-      text: c.text.split(/\s+/).slice(0, CFG.CHUNK_WORD_CAP).join(' ')
+      text: c.text.split(/\s+/).slice(0, wordCap).join(' ')
     }));
 
     const opts = {
@@ -1559,7 +1580,7 @@ const UI = {
       this.setThinkLabel('Searching knowledge base…');
       chunks=await SEARCH.retrieve(query);
       let rawAnswer,llmUsed=false;
-      if(LLM.isLoaded()){
+      if(LLM.isLoaded() && LLM.wordCap() !== 0){
         this.setThinkLabel('Synthesizing answer…');
         // Let any pending GPU/WASM work from retrieval fully settle before
         // handing the GPU to WebLLM — avoids buffer contention.
@@ -2083,22 +2104,45 @@ async function init(){
       }catch(e){ log('   ✗ FAIL — '+(e.message||e));
         log('\n→ Fails even minimally. Problem is the app environment, not size.'); return done(); }
 
-      // 2 — LARGE in, small out  (isolates INPUT size)
+      // 2 — probe the INPUT ceiling: walk prompt sizes to find where prefill breaks.
+      // Result is saved and used to auto-fit the chunk budget on this device.
+      let ceiling = 0;
       try{
-        log('2. Large prompt, 20 tokens (tests input size)…');
-        await gen(bigPrompt+'\nSummarize in 3 words.'+nt, 20);
-        log('   ✓ PASS — large inputs are fine');
-      }catch(e){ log('   ✗ FAIL — '+(e.message||e));
-        log('\n→ INPUT size is the limit. Lower LLM_CONTEXT_K / CHUNK_WORD_CAP.'); return done(); }
+        log('2. Probing input-size ceiling…');
+        const sizes = [100, 200, 300, 450, 600, 800];   // words
+        for(const words of sizes){
+          const prompt = ('reserve guarantee average line value minus two hours pay credit rotation '
+            .repeat(Math.ceil(words/11))).split(/\s+/).slice(0,words).join(' ');
+          let ok = false;
+          for(let a=0;a<2 && !ok;a++){       // one retry per size (fault can be intermittent)
+            try{ await gen(prompt+'\nSay OK.'+nt, 8); ok = true; }
+            catch(e){ if(a===1) log('   '+words+' words ✗ ('+String(e.message||e).slice(0,50)+'…)'); 
+              else await new Promise(r=>setTimeout(r,300)); }
+          }
+          if(ok){ ceiling = words; log('   '+words+' words ✓'); }
+          else break;
+        }
+        if(ceiling >= 800){
+          log('   → No input ceiling found (≥800 words). Full budget available.');
+          localStorage.setItem('dqa.wordcap','9999');
+        } else if(ceiling > 0){
+          log('   → Safe input ceiling ≈ '+ceiling+' words. Saved — chunk budget will auto-fit.');
+          localStorage.setItem('dqa.wordcap', String(ceiling));
+        } else {
+          log('   → Even 100 words fails. This GPU cannot prefill RAG-size prompts.');
+          log('     Retrieval-only is the reliable mode on this device.');
+          localStorage.setItem('dqa.wordcap','0');
+          return done();
+        }
+      }catch(e){ log('   ✗ probe error — '+(e.message||e)); return done(); }
 
-      // 3 — small in, LARGE out  (isolates OUTPUT length)
+      // 3 — small in, LARGE out (tests output length under the ceiling)
       try{
-        log('3. Small prompt, '+CFG.MAX_TOKENS+' tokens (tests output length)…');
+        log('3. Output length test ('+CFG.MAX_TOKENS+' tokens)…');
         await gen('Write a detailed paragraph about aviation scheduling.'+nt, CFG.MAX_TOKENS);
         log('   ✓ PASS — output length is fine');
       }catch(e){ log('   ✗ FAIL — '+(e.message||e));
-        log('\n→ OUTPUT length is the limit (one GPU readback per token).');
-        log('  Lower MAX_TOKENS. Current: '+CFG.MAX_TOKENS); return done(); }
+        log('\n→ OUTPUT length is a second limit. Lower MAX_TOKENS.'); return done(); }
 
       // 4 — real pipeline
       try{
