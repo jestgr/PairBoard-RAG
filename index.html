@@ -1111,6 +1111,19 @@ const LLM = {
     UI.refreshModelStatus();
   },
 
+  // A mapAsync fault causes WebLLM to unload its engine internally; every
+  // later call then fails with 'Model not loaded'. Recreate it cleanly.
+  // Sequenced (never concurrent) so we don't unmap live buffers.
+  async reload(onProgress){
+    try{ await ST.llm?.unload?.(); }catch{}
+    ST.llm=null; ST.llmReady=false;
+    await this.load(onProgress||(()=>{}));
+  },
+
+  isUnloadedError(msg){
+    return /not loaded|unload|no model|engine/i.test(msg);
+  },
+
   // Is the current model reasoning-capable (Qwen3)?
   currentIsReasoning(){
     const m = MODELCAT.find(x=>x.id===CFG.LLM_MODEL);
@@ -1207,9 +1220,8 @@ const LLM = {
       max_tokens: maxTok,
     };
 
-    // The mapAsync failure is INTERMITTENT and scales with the number of tokens
-    // generated (one GPU readback per token). Retrying the completion call is
-    // safe — unlike re-creating the engine, which unmaps live buffers.
+    // A mapAsync fault leaves WebLLM unloaded, so a bare retry hits
+    // 'Model not loaded'. Reload the engine between attempts.
     let lastErr;
     for(let attempt=0; attempt<3; attempt++){
       try{
@@ -1218,11 +1230,13 @@ const LLM = {
       }catch(err){
         lastErr = err;
         const msg = err.message||String(err);
-        const transient = msg.includes('mapAsync')||msg.includes('GPUBuffer')||msg.includes('unmapped');
-        if(!transient) throw err;
+        const gpuFault = msg.includes('mapAsync')||msg.includes('GPUBuffer')||msg.includes('unmapped');
+        const unloaded = this.isUnloadedError(msg);
+        if(!gpuFault && !unloaded) throw err;
         if(attempt<2){
-          UI.setThinkLabel(`GPU hiccup — retrying (${attempt+2}/3)…`);
-          await new Promise(r=>setTimeout(r, 400));
+          UI.setThinkLabel(`GPU fault — reloading model (${attempt+2}/3)…`);
+          try{ await this.reload(); }catch(e){ throw lastErr; }
+          await new Promise(r=>setTimeout(r, 300));
         }
       }
     }
@@ -2113,14 +2127,21 @@ async function init(){
         for(const words of sizes){
           const prompt = ('reserve guarantee average line value minus two hours pay credit rotation '
             .repeat(Math.ceil(words/11))).split(/\s+/).slice(0,words).join(' ');
-          let ok = false;
+          let ok = false, firstErr = '';
           for(let a=0;a<2 && !ok;a++){       // one retry per size (fault can be intermittent)
-            try{ await gen(prompt+'\nSay OK.'+nt, 8); ok = true; }
-            catch(e){ if(a===1) log('   '+words+' words ✗ ('+String(e.message||e).slice(0,50)+'…)'); 
-              else await new Promise(r=>setTimeout(r,300)); }
+            try{
+              if(!ST.llm || !ST.llmReady) await LLM.reload();
+              await gen(prompt+'\nSay OK.'+nt, 8); ok = true;
+            }catch(e){
+              const m = String(e.message||e);
+              if(a===0) firstErr = m;
+              // WebLLM unloads itself after a GPU fault — rebuild before retrying
+              try{ await LLM.reload(); }catch{}
+              await new Promise(r=>setTimeout(r,300));
+            }
           }
           if(ok){ ceiling = words; log('   '+words+' words ✓'); }
-          else break;
+          else { log('   '+words+' words ✗ — '+firstErr.slice(0,70)); break; }
         }
         if(ceiling >= 800){
           log('   → No input ceiling found (≥800 words). Full budget available.');
