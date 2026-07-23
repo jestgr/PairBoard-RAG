@@ -1,12 +1,21 @@
 /* ============================================================
    DocQA Service Worker
-   Caches the app shell only. Deliberately does NOT cache:
-     - WebLLM / transformers.js CDN bundles (huge, cross-origin)
-     - Model weights (the browser's own cache handles these)
-   IMPORTANT: bump CACHE_VERSION on every deploy or installed
-   users keep the stale shell.
+
+   Two jobs:
+   1. Cache the app shell (offline launch).
+   2. Inject COOP/COEP headers so SharedArrayBuffer is available,
+      which lets wllama run multi-threaded CPU inference. GitHub
+      Pages cannot set headers, so the SW adds them to responses.
+      'credentialless' is used rather than 'require-corp' so
+      cross-origin fetches (CDN, Hugging Face model files) still work.
+
+   Model weights are NOT cached here — wllama manages its own model
+   cache, so a model downloads once and reloads from disk after that.
+
+   IMPORTANT: bump CACHE_VERSION on every deploy or installed users
+   keep the stale shell.
    ============================================================ */
-const CACHE_VERSION = 'docqa-v14';   // ← bump this on every deploy
+const CACHE_VERSION = 'docqa-v17';   // <- bump this on every deploy
 const SHELL = [
   './',
   './index.html',
@@ -15,7 +24,10 @@ const SHELL = [
   './icon-512.png',
 ];
 
-// Install — pre-cache the shell
+// Escape hatch: load any page with ?nocoi=1 to disable header injection
+// if COEP ever blocks a resource.
+let COI_ENABLED = true;
+
 self.addEventListener('install', event => {
   event.waitUntil(
     caches.open(CACHE_VERSION)
@@ -24,7 +36,6 @@ self.addEventListener('install', event => {
   );
 });
 
-// Activate — drop old caches
 self.addEventListener('activate', event => {
   event.waitUntil(
     caches.keys().then(keys =>
@@ -33,26 +44,39 @@ self.addEventListener('activate', event => {
   );
 });
 
-// Fetch strategy:
-//   - Same-origin shell  → cache-first (works fully offline)
-//   - Everything else    → straight to network (CDN, model weights)
+self.addEventListener('message', e => {
+  if (e.data && e.data.type === 'disable-coi') COI_ENABLED = false;
+});
+
+// Add cross-origin isolation headers to same-origin responses.
+function withCOI(response) {
+  if (!COI_ENABLED || !response || response.status === 0) return response;
+  const headers = new Headers(response.headers);
+  headers.set('Cross-Origin-Embedder-Policy', 'credentialless');
+  headers.set('Cross-Origin-Opener-Policy', 'same-origin');
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 self.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
 
-  // Only handle same-origin GET requests; let CDN/model traffic pass through
-  if (url.origin !== self.location.origin || event.request.method !== 'GET') {
-    return;  // default browser handling
-  }
+  if (url.searchParams.get('nocoi') === '1') COI_ENABLED = false;
+
+  // Cross-origin (CDN bundles, Hugging Face model files) - pass straight through.
+  if (url.origin !== self.location.origin || event.request.method !== 'GET') return;
 
   event.respondWith(
     caches.match(event.request).then(cached => {
-      if (cached) return cached;
+      if (cached) return withCOI(cached);
       return fetch(event.request).then(resp => {
-        // Cache newly-fetched same-origin assets (e.g. icons) for next time
         const copy = resp.clone();
-        caches.open(CACHE_VERSION).then(c => c.put(event.request, copy)).catch(()=>{});
-        return resp;
-      }).catch(() => cached);  // offline + not cached → fail gracefully
+        caches.open(CACHE_VERSION).then(c => c.put(event.request, copy)).catch(() => {});
+        return withCOI(resp);
+      }).catch(() => cached);
     })
   );
 });

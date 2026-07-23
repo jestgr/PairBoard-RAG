@@ -13,13 +13,17 @@
 <title>DocQA — PairBoard</title>
 
 <!-- ============================================================
-     DocQA Module — v0.2
-     Changes from v0.1:
-       - Progressive chunk save (batch of 20); crash-safe import
-       - Interrupted import detection + resume / discard on startup
-       - Feedback logging (query · chunks · answer · rating)
-       - Chunk X of N live counter during embedding
-       - DB bumped to v2 (adds feedback store; existing data unaffected)
+     DocQA Module — v1.0 (wllama engine)
+     Engine: wllama (llama.cpp -> WebAssembly), CPU-only.
+       n_gpu_layers:0 disables wllama v3's automatic WebGPU offload.
+       WebGPU driver faults were the entire prior failure class.
+     Models: GGUF (Q4_K_M) pulled from Hugging Face, cached by wllama
+       so each model downloads once and reloads from disk after that.
+     Persistence: documents, chunks and embeddings live in IndexedDB;
+       nothing is re-chunked or re-embedded on app start or update.
+     Privacy: all inference and storage is local. The only data that
+       ever moves is a feedback file the user chooses to export, and
+       a knowledge package the curator chooses to publish.
      ============================================================ -->
 
 <script>
@@ -432,8 +436,12 @@ textarea{font-family:var(--font-ui);}
 
         <div>
           <div class="dqa-label">Language Model · Answer Synthesis</div>
-          <div class="dqa-alert warn" id="dqa-webgpu-warn" style="display:none;margin-bottom:8px">⚠ WebGPU unavailable. Retrieval-only mode active — top passages returned without synthesis.</div>
           <div class="dqa-alert info" id="dqa-device-info" style="margin-bottom:8px">Detecting device capability…</div>
+          <label class="dqa-think-label" style="margin-bottom:10px">
+            <span>Load model automatically on startup <span class="dqa-think-hint">— uses cached file, no re-download</span></span>
+            <input type="checkbox" id="dqa-autoload-check" onchange="window._DQA.toggleAutoload(this.checked)">
+            <span class="dqa-think-switch"></span>
+          </label>
           <div class="dqa-model-card" id="dqa-selftest-card" style="margin-bottom:12px;border-color:var(--accent-muted)">
             <div class="dqa-model-name">🔧 Synthesis self-test</div>
             <div class="dqa-model-detail">Runs three escalating generations to pinpoint exactly where synthesis fails on this device. Load a model first.</div>
@@ -559,86 +567,81 @@ const CFG = {
   CHUNK_OVERLAP:     50,
   INGEST_BATCH:      20,
   TOP_K:             12,    // passages retrieved & shown as sources
-  LLM_CONTEXT_K:     6,     // chunks fed to LLM in normal mode
-  LLM_CONTEXT_K_THINK: 3,   // fewer chunks when thinking (reasoning needs token room)
-  CHUNK_WORD_CAP:    180,   // words per chunk fed to LLM (context-window budget)
-  MAX_TOKENS:        400,   // generation length drives mapAsync failures — keep modest
-  MAX_TOKENS_THINK:  900,   // thinking needs room for its reasoning chain
+  LLM_CONTEXT_K:     8,     // chunks fed to the model in normal mode
+  LLM_CONTEXT_K_THINK: 5,   // fewer when thinking (reasoning needs token room)
+  CHUNK_WORD_CAP:    200,   // words per chunk fed to the model
+  MAX_TOKENS:        512,   // normal answer budget
+  MAX_TOKENS_THINK:  1024,  // thinking: reasoning block + answer
+  N_CTX:             4096,  // llama.cpp context window (RAM cost scales with this)
   GOLDEN_THRESHOLD:  0.82,  // cosine similarity to trigger golden pair injection
   EMBED_MODEL:       'Xenova/all-MiniLM-L6-v2',
-  LLM_MODEL:         'Llama-3.2-1B-Instruct-q4f16_1-MLC', // overridden by saved picker choice
+  LLM_MODEL:         'qwen2.5-0.5b',   // overridden by saved picker choice
   DB_NAME:           'dqa_v1',
-  DB_VER:            4,     // v4: added golden pairs store
+  DB_VER:            4,
   KB_SCHEMA_VER:     '1',
-  MODEL_PREF_KEY:    'dqa.model',    // localStorage key for picker selection
-  THINK_PREF_KEY:    'dqa.thinking', // localStorage key for thinking toggle
+  MODEL_PREF_KEY:    'dqa.model',
+  THINK_PREF_KEY:    'dqa.thinking',
+  AUTOLOAD_KEY:      'dqa.autoload',
+  PENDING_KEY:       'dqa.pending',   // in-flight query, for resume-on-return
 };
 
 // ================================================================
-// MODELCAT — selectable LLM catalog (all q4f16_1 — need shader-f16)
-// `reasoning:true` marks Qwen3 models that support thinking mode.
-// maxTier gates compatibility against detected device tier.
+// MODELCAT — selectable GGUF models (llama.cpp / wllama, CPU)
+//   repo/file  → Hugging Face GGUF source (cached after first download)
+//   maxTier    → 'universal' any device · 'mid' 4GB+ · 'high' 8GB+
+//   reasoning  → Qwen3 family, supports /think mode
+//   speed      → rough tokens/sec on a modern phone, single-thread
+// Q4_K_M throughout: best quality-per-byte for CPU inference.
 // ================================================================
 const MODELCAT = [
   {
-    id:   'Qwen2.5-0.5B-Instruct-q4f16_1-MLC',
-    name: 'Qwen 2.5 · 0.5B', dl:'~350 MB', maxTier:'universal', tier:'light', reasoning:false,
-    pros: 'Smallest & fastest · proven on mobile WebGPU',
-    cons: 'Most basic synthesis — best for simple, direct questions',
+    id:'qwen2.5-0.5b', name:'Qwen 2.5 · 0.5B',
+    repo:'bartowski/Qwen2.5-0.5B-Instruct-GGUF', file:'Qwen2.5-0.5B-Instruct-Q4_K_M.gguf',
+    dl:'~400 MB', ram:'~0.7 GB', speed:'fastest', maxTier:'universal', tier:'light', reasoning:false,
+    pros:'Smallest and fastest · runs on any device · light on battery',
+    cons:'Basic synthesis — best for direct, single-source questions',
   },
   {
-    id:   'Qwen3-0.6B-q4f16_1-MLC',
-    name: 'Qwen 3 · 0.6B', dl:'~400 MB', maxTier:'universal', tier:'light', reasoning:true,
-    pros: 'Tiny + optional thinking mode for step-by-step reasoning',
-    cons: 'Small model — thinking helps but depth is limited',
+    id:'qwen3-0.6b', name:'Qwen 3 · 0.6B',
+    repo:'unsloth/Qwen3-0.6B-GGUF', file:'Qwen3-0.6B-Q4_K_M.gguf',
+    dl:'~500 MB', ram:'~0.9 GB', speed:'fast', maxTier:'universal', tier:'light', reasoning:true,
+    pros:'Tiny but supports thinking mode for step-by-step reasoning',
+    cons:'Limited depth — thinking helps, but it is still a small model',
   },
   {
-    id:   'Llama-3.2-1B-Instruct-q4f16_1-MLC',
-    name: 'Llama 3.2 · 1B', dl:'~700 MB', maxTier:'universal', tier:'light', reasoning:false,
-    pros: 'Fast · small download · solid for everyday lookups',
-    cons: 'May miss nuance on complex multi-source questions',
+    id:'llama3.2-1b', name:'Llama 3.2 · 1B',
+    repo:'bartowski/Llama-3.2-1B-Instruct-GGUF', file:'Llama-3.2-1B-Instruct-Q4_K_M.gguf',
+    dl:'~800 MB', ram:'~1.3 GB', speed:'fast', maxTier:'universal', tier:'light', reasoning:false,
+    pros:'Reliable everyday lookups · good speed/quality balance',
+    cons:'May miss nuance when combining several sources',
   },
   {
-    id:   'Qwen3-1.7B-q4f16_1-MLC',
-    name: 'Qwen 3 · 1.7B', dl:'~1.1 GB', maxTier:'universal', tier:'balanced', reasoning:true,
-    pros: 'Best balance — strong reasoning + thinking mode · phone-friendly',
-    cons: 'Thinking mode is slower · uses more context',
+    id:'qwen3-1.7b', name:'Qwen 3 · 1.7B',
+    repo:'unsloth/Qwen3-1.7B-GGUF', file:'Qwen3-1.7B-Q4_K_M.gguf',
+    dl:'~1.1 GB', ram:'~2.0 GB', speed:'moderate', maxTier:'mid', tier:'balanced', reasoning:true,
+    pros:'Best overall balance · thinking mode handles interacting rules well',
+    cons:'Noticeably slower than the 1B models, especially when thinking',
   },
   {
-    id:   'Llama-3.2-3B-Instruct-q4f16_1-MLC',
-    name: 'Llama 3.2 · 3B', dl:'~1.7 GB', maxTier:'universal', tier:'balanced', reasoning:false,
-    pros: 'Solid multi-source synthesis · good speed on modern phones',
-    cons: 'Larger download · slower than 1B on older devices',
+    id:'qwen2.5-3b', name:'Qwen 2.5 · 3B',
+    repo:'bartowski/Qwen2.5-3B-Instruct-GGUF', file:'Qwen2.5-3B-Instruct-Q4_K_M.gguf',
+    dl:'~1.9 GB', ram:'~3.0 GB', speed:'slow', maxTier:'mid', tier:'balanced', reasoning:false,
+    pros:'Strong multi-source synthesis · good at structured contract language',
+    cons:'Large download · slow on phones — better on tablets and desktops',
   },
   {
-    id:   'Hermes-3-Llama-3.2-3B-q4f16_1-MLC',
-    name: 'Hermes 3 · 3B', dl:'~1.7 GB', maxTier:'universal', tier:'balanced', reasoning:false,
-    pros: 'Tuned for structured formats — best citation reliability at this size',
-    cons: 'Same hardware needs as Llama 3B',
+    id:'llama3.2-3b', name:'Llama 3.2 · 3B',
+    repo:'bartowski/Llama-3.2-3B-Instruct-GGUF', file:'Llama-3.2-3B-Instruct-Q4_K_M.gguf',
+    dl:'~2.0 GB', ram:'~3.2 GB', speed:'slow', maxTier:'high', tier:'best', reasoning:false,
+    pros:'Thorough answers with good edge-case coverage',
+    cons:'Slow on phones · needs 8 GB RAM to be comfortable',
   },
   {
-    id:   'Qwen3-4B-q4f16_1-MLC',
-    name: 'Qwen 3 · 4B', dl:'~2.4 GB', maxTier:'standard', tier:'best', reasoning:true,
-    pros: 'Best reasoning available on-device · thinking mode for complex rules',
-    cons: 'Flagship phone / tablet / desktop only · big download',
-  },
-  {
-    id:   'Phi-3.5-mini-instruct-q4f16_1-MLC',
-    name: 'Phi 3.5 Mini · 3.8B', dl:'~2.2 GB', maxTier:'standard', tier:'best', reasoning:false,
-    pros: 'Strong on regulatory text · excellent instruction following',
-    cons: 'Needs flagship phone or desktop · big download',
-  },
-  {
-    id:   'Mistral-7B-Instruct-v0.3-q4f16_1-MLC',
-    name: 'Mistral · 7B', dl:'~4.0 GB', maxTier:'desktop', tier:'best', reasoning:false,
-    pros: 'Near-desktop quality · handles dense multi-document context',
-    cons: 'Desktop / M-series Mac only · long first download',
-  },
-  {
-    id:   'Llama-3.1-8B-Instruct-q4f16_1-MLC',
-    name: 'Llama 3.1 · 8B', dl:'~4.6 GB', maxTier:'desktop', tier:'best', reasoning:false,
-    pros: 'Best available quality — thorough answers, best edge-case coverage',
-    cons: 'Desktop-class GPU required · largest download',
+    id:'qwen3-4b', name:'Qwen 3 · 4B',
+    repo:'unsloth/Qwen3-4B-GGUF', file:'Qwen3-4B-Q4_K_M.gguf',
+    dl:'~2.5 GB', ram:'~4.0 GB', speed:'slowest', maxTier:'high', tier:'best', reasoning:true,
+    pros:'Best available reasoning on-device · strongest with thinking mode',
+    cons:'Big download and slow generation — desktop/tablet territory',
   },
 ];
 
@@ -648,8 +651,9 @@ const MODELCAT = [
 const ST = {
   docs: [], chunks: [],
   embedder:null, llm:null,
-  llmReady:false, embedReady:false, webgpuOk:false, busy:false,
+  llmReady:false, embedReady:false, busy:false,
   thinking: false,   // user toggle for Qwen3 thinking mode
+  autoResumes: 0,    // guards against resume loops
 };
 
 // ================================================================
@@ -1029,57 +1033,47 @@ const GOLDEN = {
   }
 };
 // ================================================================
-// LLM — WebLLM Llama on main thread (WebGPU async, cache-safe)
-// Note: blob workers have null origin and can't access Cache API,
-// causing re-downloads every session. Main thread preserves cache.
-// GPU inference is async so main thread remains responsive during generation.
+// LLM — wllama (llama.cpp compiled to WebAssembly)
+// CPU-only by design: n_gpu_layers:0 disables wllama v3's automatic
+// WebGPU offload. WebGPU driver faults were the entire previous bug
+// class; WASM/SIMD has no such dependency and runs everywhere.
+// Model files are cached by wllama automatically (Cache API), so a
+// model is downloaded once and reloaded from disk in later sessions.
 // ================================================================
-const LLM = {
-  device: { webgpu:false, maxBuf:0, tier:'none', label:'No WebGPU' },
+const WLLAMA_ESM  = 'https://cdn.jsdelivr.net/npm/@wllama/wllama@3/esm/index.js';
+const WLLAMA_WASM = 'https://cdn.jsdelivr.net/npm/@wllama/wllama@3/esm/wasm-from-cdn.js';
 
-  // Probe WebGPU adapter. Note: maxBufferSize is the largest SINGLE buffer
-  // a browser exposes — often a conservative spec default (e.g. 2GB on mobile
-  // Chrome) that does NOT reflect true GPU memory. We use it only to gate the
-  // very largest models, and lean permissive: most modern phones run 3B fine
-  // even when reporting a 2GB max-buffer limit.
-  async detectDevice(){
-    try{
-      const adapter = await navigator.gpu?.requestAdapter();
-      if(!adapter){ this.device={webgpu:false,maxBuf:0,tier:'none',f16:false,label:'No WebGPU'}; return this.device; }
-      const maxBuf = adapter.limits?.maxBufferSize ?? 0;
-      const maxStorage = adapter.limits?.maxStorageBufferBindingSize ?? 0;
-      const mb = Math.round(maxBuf/1048576);
-      const effMb = Math.round(Math.max(maxBuf, maxStorage)/1048576);
-      const f16 = adapter.features?.has?.('shader-f16') ?? false;
-      let tier, label;
-      if      (effMb >= 4000) { tier='high'; label=`Capable GPU detected`; }
-      else if (effMb >= 1800) { tier='mid';  label=`Standard GPU detected`; }
-      else                    { tier='low';  label=`Limited GPU detected`; }
-      if(!f16) label += ' · no shader-f16 (synthesis unavailable)';
-      this.device = { webgpu:true, maxBuf:mb, effMb, tier, f16, label };
-    }catch{ this.device={webgpu:false,maxBuf:0,effMb:0,tier:'none',f16:false,label:'No WebGPU'}; }
+const LLM = {
+  _w: null,
+  device: { ram:0, cores:2, mt:false, tier:'low', label:'' },
+
+  // Capability now depends on RAM + cores, not GPU features.
+  detectDevice(){
+    const ram   = navigator.deviceMemory || 0;          // GB (Chrome caps at 8)
+    const cores = navigator.hardwareConcurrency || 2;
+    const mt    = typeof SharedArrayBuffer !== 'undefined' && !!self.crossOriginIsolated;
+    let tier;
+    if      (ram >= 8 && cores >= 6) tier = 'high';
+    else if (ram >= 4 && cores >= 4) tier = 'mid';
+    else                             tier = 'low';
+    this.device = { ram, cores, mt, tier,
+      label: `${ram?ram+' GB RAM':'RAM unknown'} · ${cores} cores · ${mt?'multi-thread':'single-thread'}` };
     return this.device;
   },
 
-  // q4f16 models need shader-f16. Without it, no model is compatible → retrieval-only.
   isCompatible(model){
-    if(!this.device.webgpu || !this.device.f16) return false;
     const t = this.device.tier;
-    if(t==='high') return true;
-    if(t==='mid')  return model.maxTier!=='desktop';
-    if(t==='low')  return model.maxTier==='universal';
-    return false;
+    if (t === 'high') return true;
+    if (t === 'mid')  return model.maxTier !== 'high';
+    return model.maxTier === 'universal';
   },
 
-  // Pick best compatible default: largest 'balanced' that fits, else largest light.
   autoDefault(){
     const fits = MODELCAT.filter(m=>this.isCompatible(m));
-    if(!fits.length) return null;
+    if(!fits.length) return MODELCAT[0].id;
     const balanced = fits.filter(m=>m.tier==='balanced');
-    if(balanced.length) return balanced[balanced.length-1].id;
-    const light = fits.filter(m=>m.tier==='light');
-    if(light.length) return light[light.length-1].id;
-    return fits[fits.length-1].id;
+    if(balanced.length) return balanced[0].id;
+    return fits[0].id;
   },
 
   currentModel(){
@@ -1089,58 +1083,43 @@ const LLM = {
     return this.autoDefault();
   },
 
-  async checkWebGPU(){
-    try{return !!(await navigator.gpu?.requestAdapter());}catch{return false;}
+  isLoaded(){ return !!(ST.llmReady && this._w); },
+
+  async unload(){
+    try{ await this._w?.exit?.(); }catch{}
+    this._w = null; ST.llm = null; ST.llmReady = false;
   },
 
-  // Single source of truth for load state — used by BOTH picker and chat
-  isLoaded(){ return !!(ST.llmReady && ST.llm); },
-
   async load(onProgress){
-    // Dispose any existing engine before creating a new one — prevents
-    // consuming a second GPU adapter while the first is still held.
-    if(ST.llm){
-      try{ await ST.llm.unload?.(); }catch{}
-      ST.llm=null; ST.llmReady=false;
-    }
-    const webllm = await import('https://esm.run/@mlc-ai/web-llm');
-    ST.llm = await webllm.CreateMLCEngine(CFG.LLM_MODEL, {
-      initProgressCallback: p => onProgress(Math.round((p.progress??0)*100))
+    await this.unload();
+    const [mod, wasm] = await Promise.all([ import(WLLAMA_ESM), import(WLLAMA_WASM) ]);
+    const { Wllama } = mod;
+    this._w = new Wllama(wasm.default, { parallelDownloads: 3 });
+
+    const m = MODELCAT.find(x=>x.id===CFG.LLM_MODEL) || MODELCAT[0];
+    await this._w.loadModelFromHF({ repo:m.repo, file:m.file }, {
+      n_ctx:        CFG.N_CTX,
+      n_threads:    this.device.mt ? Math.min(this.device.cores, 4) : 1,
+      n_gpu_layers: 0,          // CPU only — do NOT let wllama v3 use WebGPU
+      progressCallback: ({loaded,total}) =>
+        onProgress && onProgress(total ? Math.round(loaded/total*100) : 0),
     });
-    ST.llmReady = true;
+    ST.llm = this._w; ST.llmReady = true;
     UI.refreshModelStatus();
   },
 
-  // A mapAsync fault causes WebLLM to unload its engine internally; every
-  // later call then fails with 'Model not loaded'. Recreate it cleanly.
-  // Sequenced (never concurrent) so we don't unmap live buffers.
-  async reload(onProgress){
-    try{ await ST.llm?.unload?.(); }catch{}
-    ST.llm=null; ST.llmReady=false;
-    await this.load(onProgress||(()=>{}));
-  },
-
-  isUnloadedError(msg){
-    return /not loaded|unload|no model|engine/i.test(msg);
-  },
-
-  // Is the current model reasoning-capable (Qwen3)?
   currentIsReasoning(){
     const m = MODELCAT.find(x=>x.id===CFG.LLM_MODEL);
     return !!(m && m.reasoning);
   },
-
-  // Is thinking mode both available (Qwen3) AND enabled by the user?
-  thinkingActive(){
-    return this.currentIsReasoning() && ST.thinking;
-  },
+  thinkingActive(){ return this.currentIsReasoning() && ST.thinking; },
 
   buildMessages(query,chunks,thinking){
     const curatorChunk   = chunks.find(c=>c.isGolden&&c.authority==='curator');
     const communityChunk = chunks.find(c=>c.isGolden&&c.authority==='approved');
     const passages = chunks.map((c,i)=>{
       let label;
-      if (c.isGolden && c.authority==='curator')  label='[VERIFIED ANSWER]';
+      if (c.isGolden && c.authority==='curator')       label='[VERIFIED ANSWER]';
       else if (c.isGolden && c.authority==='approved') label='[COMMUNITY ANSWER]';
       else label=`[${i+1}]`;
       return `${label} ${c.docName}${c.page!=='—'?' — Page '+c.page:''}\n${c.text}`;
@@ -1152,8 +1131,6 @@ const LLM = {
       ? 'The passage marked [COMMUNITY ANSWER] has been reviewed and approved — use it as helpful context but verify against the other source passages.'
       : '';
 
-    // In thinking mode, ask for reasoning through interactions; the model emits
-    // its own <think> block, so we don't request one in the format.
     const thinkNote = thinking
       ? ' Reason step by step through how the rules interact before answering, considering edge cases and how multiple provisions combine.'
       : '';
@@ -1162,96 +1139,52 @@ const LLM = {
       {role:'system', content:
         'You are an aviation reference assistant with deep knowledge of FARs, airline contracts, and operational procedures.' +
         (goldenNote?' '+goldenNote:'') +
-        ' Answer using ONLY the source passages provided.' +
-        thinkNote +
-        ' Provide a thorough, complete answer covering all relevant aspects and edge cases found in the passages — do not oversimplify.' +
+        ' Answer using ONLY the source passages provided.' + thinkNote +
+        ' Provide a thorough, complete answer covering all relevant aspects and edge cases found in the passages.' +
         ' If passages contain partial or related information, include it even if not a direct answer.' +
         ' After your answer, list each source cited with a short direct quote (under 20 words).' +
         ' If passages do not fully answer the question, explicitly state what is missing.' +
         ' Format:\nAnswer: [full answer]\n\nCitations:\n• [Source — Page N] — "direct quote"'},
       // Qwen3 reads /think and /no_think control tokens from the user message.
-      // WebLLM does NOT support `extra_body.enable_thinking`, so this is the
-      // only reliable way to turn its reasoning chain on or off. Left ON by
-      // default, Qwen3 burns hundreds of tokens on hidden reasoning.
       {role:'user', content:`SOURCE PASSAGES:\n\n${passages}\n\nQUESTION: ${query}` +
         (this.currentIsReasoning() ? (thinking ? ' /think' : ' /no_think') : '')}
     ];
   },
 
-  async synthesize(query,chunks){
-    return await this._call(query,chunks);
-  },
-
-  // Device input-word ceiling measured by the self-test probe.
-  // 9999 = no ceiling found · 0 = device can't prefill RAG prompts · null = untested
-  wordCap(){
-    const v = localStorage.getItem('dqa.wordcap');
-    return v===null ? null : parseInt(v,10);
-  },
+  async synthesize(query,chunks){ return await this._call(query,chunks); },
 
   async _call(query,chunks){
     const thinking = this.thinkingActive();
-    let   k        = thinking ? CFG.LLM_CONTEXT_K_THINK : CFG.LLM_CONTEXT_K;
-    const maxTok   = thinking ? CFG.MAX_TOKENS_THINK : CFG.MAX_TOKENS;
-    let   wordCap  = CFG.CHUNK_WORD_CAP;
-
-    // Fit the prompt under the device's measured prefill ceiling. The system
-    // prompt + question cost ~150 words, so budget the rest for passages.
-    const cap = this.wordCap();
-    if(cap !== null && cap < 9999){
-      const budget = Math.max(80, cap - 150);
-      const perChunk = Math.floor(budget / k);
-      if(perChunk < 60){                       // too tight — drop chunks instead
-        k = Math.max(1, Math.floor(budget / 80));
-        wordCap = Math.max(60, Math.floor(budget / k));
-      } else {
-        wordCap = Math.min(CFG.CHUNK_WORD_CAP, perChunk);
-      }
-    }
+    const k        = thinking ? CFG.LLM_CONTEXT_K_THINK : CFG.LLM_CONTEXT_K;
+    const maxTok   = thinking ? CFG.MAX_TOKENS_THINK    : CFG.MAX_TOKENS;
 
     const ctx = chunks.slice(0, k).map(c=>({
-      ...c,
-      text: c.text.split(/\s+/).slice(0, wordCap).join(' ')
+      ...c, text: c.text.split(/\s+/).slice(0, CFG.CHUNK_WORD_CAP).join(' ')
     }));
 
-    const opts = {
-      messages: this.buildMessages(query, ctx, thinking),
-      temperature: thinking ? 0.6 : 0.2,   // Qwen3 thinking prefers ~0.6
-      max_tokens: maxTok,
-    };
-
-    // A mapAsync fault leaves WebLLM unloaded, so a bare retry hits
-    // 'Model not loaded'. Reload the engine between attempts.
-    let lastErr;
-    for(let attempt=0; attempt<3; attempt++){
-      try{
-        const resp = await ST.llm.chat.completions.create(opts);
-        return resp.choices[0].message.content;
-      }catch(err){
-        lastErr = err;
-        const msg = err.message||String(err);
-        const gpuFault = msg.includes('mapAsync')||msg.includes('GPUBuffer')||msg.includes('unmapped');
-        const unloaded = this.isUnloadedError(msg);
-        if(!gpuFault && !unloaded) throw err;
-        if(attempt<2){
-          UI.setThinkLabel(`GPU fault — reloading model (${attempt+2}/3)…`);
-          try{ await this.reload(); }catch(e){ throw lastErr; }
-          await new Promise(r=>setTimeout(r, 300));
-        }
-      }
-    }
-    throw lastErr;
+    const resp = await this._w.createChatCompletion({
+      messages:    this.buildMessages(query, ctx, thinking),
+      max_tokens:  maxTok,
+      temperature: thinking ? 0.6 : 0.2,
+      top_k: 40, top_p: 0.9,
+    });
+    return resp.choices[0].message.content;
   },
 
-  // Strip the <think>...</think> reasoning block from Qwen3 output, returning
-  // both the visible answer and the hidden reasoning (for optional display).
+  // Strip Qwen3 <think>…</think> so the answer stays clean; reasoning is
+  // returned separately for the collapsible block.
   splitThinking(raw){
     const m = raw.match(/<think>([\s\S]*?)<\/think>/);
     if(!m) return { answer: raw.trim(), reasoning: null };
-    return {
-      answer: raw.replace(/<think>[\s\S]*?<\/think>/,'').trim(),
-      reasoning: m[1].trim(),
-    };
+    return { answer: raw.replace(/<think>[\s\S]*?<\/think>/,'').trim(), reasoning: m[1].trim() };
+  },
+
+  // Downloaded model files cached by wllama (guarded — API may vary by version)
+  async cachedModels(){
+    try{ return await this._w?.cacheManager?.list?.() ?? []; }catch{ return []; }
+  },
+  async clearCache(){
+    try{ await this._w?.cacheManager?.clear?.(); return true; }catch{ return false; }
   }
 };
 
@@ -1562,14 +1495,43 @@ const UI = {
   },
 
   fallbackAnswer(chunks,feedbackId){
-    // Distinguish: no model selected vs selected-but-not-loaded-this-session
     const sel = MODELCAT.find(m=>m.id===CFG.LLM_MODEL);
-    const msg = !ST.webgpuOk
-      ? `Found ${chunks.length} relevant passages. This device can't run answer synthesis (no WebGPU) — showing top passages.`
-      : sel
-      ? `Found ${chunks.length} relevant passages. To get a synthesized answer, open the Models tab and tap "Download & Load" on ${sel.name} — it must be loaded once per session.`
+    const msg = sel
+      ? `Found ${chunks.length} relevant passages. For a synthesized answer, open the Models tab and load ${sel.name}. Enable "Load model automatically on startup" to skip this step next time.`
       : `Found ${chunks.length} relevant passages. Select and load a model in the Models tab for a synthesized answer.`;
     return this.renderAnswer(msg, chunks, false, feedbackId);
+  },
+
+  // ── Pending-query persistence (resume after background freeze) ──
+  // A browser freezes background tabs, so a long generation can be killed
+  // mid-flight. We record the in-flight query and resume it on return
+  // instead of losing the work or showing a spurious error.
+  savePending(query){
+    try{ localStorage.setItem(CFG.PENDING_KEY, JSON.stringify({query, ts:Date.now()})); }catch{}
+  },
+  clearPending(){ try{ localStorage.removeItem(CFG.PENDING_KEY); }catch{} },
+  getPending(){
+    try{
+      const raw = localStorage.getItem(CFG.PENDING_KEY);
+      if(!raw) return null;
+      const p = JSON.parse(raw);
+      // Ignore stale entries (older than an hour)
+      if(Date.now()-p.ts > 3600000){ this.clearPending(); return null; }
+      return p;
+    }catch{ return null; }
+  },
+
+  // Auto-resume when the tab becomes visible again, if work was interrupted.
+  initResume(){
+    document.addEventListener('visibilitychange',()=>{
+      if(document.hidden || ST.busy) return;
+      const p = this.getPending();
+      if(!p) return;
+      if(ST.autoResumes >= 2){ this.clearPending(); return; }  // no infinite loops
+      ST.autoResumes++;
+      this.appendMsg('ai',`<div class="dqa-bubble"><div class="dqa-summary">Resuming your question…</div></div>`);
+      this.retryQuery(p.query);
+    });
   },
 
   async submitQuery(){
@@ -1580,12 +1542,17 @@ const UI = {
     this.appendMsg('user',`<div class="dqa-bubble">${query}</div>`);
     const thinkEl=this.appendThinking();
 
-    // Track if the tab gets backgrounded during generation (mobile GPU teardown)
+    // Record the in-flight query so it survives a background freeze
+    this.savePending(query);
+
+    // Track whether the tab was backgrounded during generation
     let wasHidden=false;
     const visHandler=()=>{ if(document.hidden) wasHidden=true; };
     document.addEventListener('visibilitychange',visHandler);
 
-    // Request screen wake lock so the OS is less aggressive reclaiming GPU
+    // Keep the screen awake so it doesn't sleep mid-generation. Note: the
+    // browser releases this automatically once the page is hidden, so it
+    // covers "waiting on screen" but cannot hold execution in the background.
     let wakeLock=null;
     try{ if('wakeLock' in navigator) wakeLock=await navigator.wakeLock.request('screen'); }catch{}
 
@@ -1594,11 +1561,8 @@ const UI = {
       this.setThinkLabel('Searching knowledge base…');
       chunks=await SEARCH.retrieve(query);
       let rawAnswer,llmUsed=false;
-      if(LLM.isLoaded() && LLM.wordCap() !== 0){
+      if(LLM.isLoaded()){
         this.setThinkLabel('Synthesizing answer…');
-        // Let any pending GPU/WASM work from retrieval fully settle before
-        // handing the GPU to WebLLM — avoids buffer contention.
-        await new Promise(r=>setTimeout(r,150));
         rawAnswer=await LLM.synthesize(query,chunks);
         llmUsed=true;
       }
@@ -1606,10 +1570,23 @@ const UI = {
       answerHtml=llmUsed
         ?this.renderAnswer(rawAnswer,chunks,true,feedbackId)
         :this.fallbackAnswer(chunks,feedbackId);
+      this.clearPending();
+      ST.autoResumes=0;
     }catch(err){
       console.error('[DocQA] query error:', err);
       const msg = err.message||String(err);
-      if(LLM.isLoaded() && chunks){
+
+      if(wasHidden){
+        // Interrupted by the browser freezing a background tab — not a real
+        // failure. Keep the pending record so it resumes on return.
+        answerHtml=`<div class="dqa-bubble">
+          <div class="dqa-mode-tag">⏸ Paused — app was in the background</div>
+          <div class="dqa-summary">The browser suspends work when the app isn't in front. This will finish automatically when you come back, or tap to continue now.</div>
+          <button class="dqa-btn dqa-btn-primary dqa-btn-sm" style="margin-top:8px"
+            onclick="window._DQA.retryQuery('${query.replace(/'/g,"\\'")}')">▶ Continue</button>
+        </div>`;
+      } else if(LLM.isLoaded() && chunks){
+        this.clearPending();
         const feedbackId=await FEEDBACK.log(query,chunks,'synthesis_error: '+msg,false);
         answerHtml=`<div class="dqa-bubble">
           <div class="dqa-mode-tag">⚠ Synthesis failed · showing retrieval</div>
@@ -1624,8 +1601,10 @@ const UI = {
           </div>`).join('')}</div>
         </div>`;
       } else if(chunks){
+        this.clearPending();
         answerHtml=this.fallbackAnswer(chunks,await FEEDBACK.log(query,chunks,'',false));
       } else {
+        this.clearPending();
         answerHtml=`<div class="dqa-bubble"><div class="dqa-summary">Error: ${msg}</div></div>`;
       }
     }finally{
@@ -1660,15 +1639,11 @@ const UI = {
   refreshModelStatus(){
     const el = document.getElementById('dqa-model-status');
     if(!el) return;
-    if(!ST.webgpuOk){
-      el.className='dqa-model-status retrieval';
-      el.textContent='⚡ Retrieval-only · this device has no WebGPU';
-    } else if(LLM.isLoaded()){
-      const m = MODELCAT.find(x=>x.id===CFG.LLM_MODEL);
+    const m = MODELCAT.find(x=>x.id===CFG.LLM_MODEL);
+    if(LLM.isLoaded()){
       el.className='dqa-model-status ready';
       el.textContent=`✦ ${m?m.name:'Model'} loaded · full synthesis active`;
     } else {
-      const m = MODELCAT.find(x=>x.id===CFG.LLM_MODEL);
       el.className='dqa-model-status retrieval';
       el.textContent=`⚡ Retrieval-only · tap to load ${m?m.name:'a model'} for synthesis`;
     }
@@ -1821,20 +1796,16 @@ const UI = {
   },
 
   async initModels(){
-    const dev = await LLM.detectDevice();
-    ST.webgpuOk = dev.webgpu;
+    const dev = LLM.detectDevice();
+    document.getElementById('dqa-device-info').textContent =
+      `Device: ${dev.label} — models beyond this device's capability are disabled.`;
 
-    const info = document.getElementById('dqa-device-info');
-    if(!dev.webgpu){
-      document.getElementById('dqa-webgpu-warn').style.display='block';
-      info.style.display='none';
-    } else {
-      info.textContent = `Device: ${dev.label} — incompatible models are disabled automatically.`;
-    }
-
-    // Set active model from saved preference (or auto default)
     const chosen = LLM.currentModel();
     if(chosen) CFG.LLM_MODEL = chosen;
+
+    const auto = localStorage.getItem(CFG.AUTOLOAD_KEY)==='1';
+    const chk = document.getElementById('dqa-autoload-check');
+    if(chk) chk.checked = auto;
 
     this.renderModelPicker();
 
@@ -1856,29 +1827,32 @@ const UI = {
         btn.disabled=false; btn.textContent='Retry'; this.setStatus('ERROR','');
       }
     });
+
+    // Auto-load the chosen model from cache (no network if already downloaded)
+    if(auto) this.loadModel(CFG.LLM_MODEL).catch(e=>console.warn('[DocQA] autoload:',e));
   },
 
   // ── Model picker ─────────────────────────────────────────────
   renderModelPicker(){
     const root = document.getElementById('dqa-model-picker');
-    if(!ST.webgpuOk){ root.innerHTML=''; return; }
-    const tierLabel = {best:'Best quality', balanced:'Balanced', light:'Light'};
+    if(!root) return;
+    const tierLabel  = {best:'Best quality', balanced:'Balanced', light:'Light'};
+    const speedLabel = {fastest:'⚡⚡⚡ fastest', fast:'⚡⚡ fast', moderate:'⚡ moderate',
+                        slow:'🐢 slow', slowest:'🐢🐢 slowest'};
 
     root.innerHTML = MODELCAT.map(m=>{
       const compat   = LLM.isCompatible(m);
       const selected = m.id===CFG.LLM_MODEL;
-      // "Loaded" requires BOTH the ready flag AND a live engine object —
-      // prevents showing Loaded after a refresh cleared the engine.
       const loaded   = selected && LLM.isLoaded();
       let action;
       if(!compat){
-        action = `<div class="dqa-mp-incompat-reason">Needs more GPU memory than this device provides</div>`;
+        action = `<div class="dqa-mp-incompat-reason">Needs more memory than this device reports (${m.ram} required)</div>`;
       } else if(loaded){
         action = `<span class="dqa-chip ok">Loaded ✓</span>`;
       } else if(selected){
         action = `<div class="dqa-mp-actions" style="width:100%">
           <button class="dqa-btn dqa-btn-primary dqa-btn-sm" id="dqa-mp-load-${m.id}"
-            onclick="window._DQA.loadModel('${m.id}')">Download &amp; Load (${m.dl})</button>
+            onclick="window._DQA.loadModel('${m.id}')">Load (${m.dl})</button>
           <div class="dqa-mp-progress" id="dqa-mp-prog-${m.id}"><div class="dqa-mp-progress-fill" id="dqa-mp-fill-${m.id}"></div></div>
         </div>`;
       } else {
@@ -1888,8 +1862,8 @@ const UI = {
       return `<div class="dqa-mp-card ${selected?'selected':''} ${compat?'':'incompatible'}">
         <div class="dqa-mp-head">
           <div>
-            <div class="dqa-mp-name">${m.name}</div>
-            <div class="dqa-mp-size">${m.dl} download</div>
+            <div class="dqa-mp-name">${m.name}${m.reasoning?' <span class="dqa-mp-size">🧠 thinking</span>':''}</div>
+            <div class="dqa-mp-size">${m.dl} download · ${m.ram} RAM · ${speedLabel[m.speed]||m.speed}</div>
           </div>
           <span class="dqa-mp-tier ${m.tier}">${tierLabel[m.tier]}</span>
         </div>
@@ -1902,13 +1876,12 @@ const UI = {
     }).join('');
   },
 
-  selectModel(id){
+  async selectModel(id){
     const m = MODELCAT.find(x=>x.id===id);
     if(!m || !LLM.isCompatible(m)) return;  // failsafe
-    if(ST.llmReady && !confirm('Switching models requires downloading and loading the new model. Continue?')) return;
     CFG.LLM_MODEL = id;
     localStorage.setItem(CFG.MODEL_PREF_KEY, id);
-    ST.llmReady = false; ST.llm = null;
+    await LLM.unload();               // free RAM before switching
     this.renderModelPicker();
     this.refreshModelStatus();
   },
@@ -1918,7 +1891,7 @@ const UI = {
     const btn  = document.getElementById(`dqa-mp-load-${id}`);
     const bar  = document.getElementById(`dqa-mp-prog-${id}`);
     const fill = document.getElementById(`dqa-mp-fill-${id}`);
-    if(btn){ btn.disabled=true; btn.textContent='Downloading…'; }
+    if(btn){ btn.disabled=true; btn.textContent='Loading…'; }
     if(bar) bar.style.display='block';
     try{
       await LLM.load(p=>{ if(fill) fill.style.width=p+'%'; });
@@ -1926,7 +1899,9 @@ const UI = {
       this.refreshModelStatus();
     }catch(err){
       if(btn){ btn.disabled=false; btn.textContent='Retry'; }
-      alert(`Model load failed: ${err.message}`);
+      console.error('[DocQA] model load failed:',err);
+      const info=document.getElementById('dqa-device-info');
+      if(info) info.textContent='Model load failed: '+(err.message||err);
     }
   },
 
@@ -2085,6 +2060,20 @@ async function init(){
   UI.refreshBanners();
   UI.setStatus('OFFLINE','');
   UI.refreshModelStatus();
+  UI.initResume();
+
+  // A query interrupted by the app being closed entirely: offer to continue it.
+  const pending = UI.getPending();
+  if(pending){
+    UI.appendMsg('ai',`<div class="dqa-bubble">
+      <div class="dqa-mode-tag">⏸ Unfinished question</div>
+      <div class="dqa-summary">"${pending.query}" didn't finish last time.</div>
+      <button class="dqa-btn dqa-btn-primary dqa-btn-sm" style="margin-top:8px"
+        onclick="window._DQA.retryQuery('${pending.query.replace(/'/g,"\\'")}')">▶ Continue</button>
+      <button class="dqa-btn dqa-btn-secondary dqa-btn-sm" style="margin-top:6px"
+        onclick="window._DQA.dismissPending(this)">Dismiss</button>
+    </div>`);
+  }
 
   window._DQA = {
     removeDoc:    id=>UI.removeDoc(id),
@@ -2094,104 +2083,61 @@ async function init(){
     gotoModels:   ()=>UI.gotoModels(),
 
     // Escalating synthesis test — isolates which layer breaks generation.
+    // Quick health check — confirms the model generates end to end.
     runSelfTest: async ()=>{
       const out = document.getElementById('dqa-selftest-out');
       const btn = document.getElementById('dqa-selftest-btn');
       out.style.display='block'; btn.disabled=true; btn.textContent='Running…';
       const log = t => { out.textContent += t+'\n'; };
       out.textContent='';
-      if(!LLM.isLoaded()){ log('✗ No model loaded. Load one first.'); btn.disabled=false; btn.textContent='Run self-test'; return; }
-      const isQwen3 = LLM.currentIsReasoning();
-      const nt = isQwen3 ? ' /no_think' : '';   // suppress Qwen3 reasoning for tests
       const done = ()=>{ btn.disabled=false; btn.textContent='Run self-test again'; };
+      if(!LLM.isLoaded()){ log('✗ No model loaded. Load one first.'); return done(); }
+      const nt = LLM.currentIsReasoning() ? ' /no_think' : '';
+      const t0 = performance.now();
 
-      const gen = (userMsg, maxTok) => ST.llm.chat.completions.create({
-        messages:[{role:'user',content:userMsg}], max_tokens:maxTok });
-
-      const bigPrompt = 'The reserve guarantee equals the average line value minus two hours. '.repeat(40);
-
-      // 1 — small in, small out
       try{
-        log('1. Small prompt, 20 tokens…');
-        const r = await gen('Say hello in 3 words.'+nt, 20);
-        log('   ✓ PASS');
-      }catch(e){ log('   ✗ FAIL — '+(e.message||e));
-        log('\n→ Fails even minimally. Problem is the app environment, not size.'); return done(); }
+        log('1. Short generation…');
+        const r = await LLM._w.createChatCompletion({
+          messages:[{role:'user',content:'Say hello in three words.'+nt}], max_tokens:24 });
+        log('   ✓ "'+LLM.splitThinking(r.choices[0].message.content).answer.trim()+'"');
+      }catch(e){ log('   ✗ FAIL — '+(e.message||e)); return done(); }
 
-      // 2 — probe the INPUT ceiling: walk prompt sizes to find where prefill breaks.
-      // Result is saved and used to auto-fit the chunk budget on this device.
-      let ceiling = 0;
       try{
-        log('2. Probing input-size ceiling…');
-        const sizes = [100, 200, 300, 450, 600, 800];   // words
-        for(const words of sizes){
-          const prompt = ('reserve guarantee average line value minus two hours pay credit rotation '
-            .repeat(Math.ceil(words/11))).split(/\s+/).slice(0,words).join(' ');
-          let ok = false, firstErr = '';
-          for(let a=0;a<2 && !ok;a++){       // one retry per size (fault can be intermittent)
-            try{
-              if(!ST.llm || !ST.llmReady) await LLM.reload();
-              await gen(prompt+'\nSay OK.'+nt, 8); ok = true;
-            }catch(e){
-              const m = String(e.message||e);
-              if(a===0) firstErr = m;
-              // WebLLM unloads itself after a GPU fault — rebuild before retrying
-              try{ await LLM.reload(); }catch{}
-              await new Promise(r=>setTimeout(r,300));
-            }
-          }
-          if(ok){ ceiling = words; log('   '+words+' words ✓'); }
-          else { log('   '+words+' words ✗ — '+firstErr.slice(0,70)); break; }
-        }
-        if(ceiling >= 800){
-          log('   → No input ceiling found (≥800 words). Full budget available.');
-          localStorage.setItem('dqa.wordcap','9999');
-        } else if(ceiling > 0){
-          log('   → Safe input ceiling ≈ '+ceiling+' words. Saved — chunk budget will auto-fit.');
-          localStorage.setItem('dqa.wordcap', String(ceiling));
-        } else {
-          log('   → Even 100 words fails. This GPU cannot prefill RAG-size prompts.');
-          log('     Retrieval-only is the reliable mode on this device.');
-          localStorage.setItem('dqa.wordcap','0');
-          return done();
-        }
-      }catch(e){ log('   ✗ probe error — '+(e.message||e)); return done(); }
+        log('2. Long prompt ('+CFG.LLM_CONTEXT_K+' chunks worth)…');
+        const filler = 'The reserve guarantee equals the average line value minus two hours. '.repeat(120);
+        const t1 = performance.now();
+        const r = await LLM._w.createChatCompletion({
+          messages:[{role:'user',content:filler+'\nSummarize that rule.'+nt}], max_tokens:120 });
+        const secs = ((performance.now()-t1)/1000).toFixed(1);
+        log('   ✓ PASS in '+secs+'s');
+      }catch(e){ log('   ✗ FAIL — '+(e.message||e)); return done(); }
 
-      // 3 — small in, LARGE out (tests output length under the ceiling)
       try{
-        log('3. Output length test ('+CFG.MAX_TOKENS+' tokens)…');
-        await gen('Write a detailed paragraph about aviation scheduling.'+nt, CFG.MAX_TOKENS);
-        log('   ✓ PASS — output length is fine');
-      }catch(e){ log('   ✗ FAIL — '+(e.message||e));
-        log('\n→ OUTPUT length is a second limit. Lower MAX_TOKENS.'); return done(); }
-
-      // 4 — real pipeline
-      try{
-        log('4. Retrieval + synthesis (real path)…');
+        log('3. Retrieval + synthesis…');
         if(!ST.embedReady){ log('   ⚠ SKIPPED — embedding model not loaded'); }
         else if(!ST.chunks.filter(c=>c.embedding).length){ log('   ⚠ SKIPPED — no indexed documents'); }
-        else {
+        else{
           const chunks = await SEARCH.retrieve('reserve pilot pay');
-          await new Promise(r=>setTimeout(r,150));
           const txt = await LLM.synthesize('How is a reserve pilot paid?', chunks);
-          log('   ✓ PASS — '+LLM.splitThinking(txt).answer.trim().slice(0,60)+'…');
-          log('\n→ All passed. Synthesis is working — ask a question in Chat.');
+          log('   ✓ '+LLM.splitThinking(txt).answer.trim().slice(0,70)+'…');
         }
-      }catch(e){ log('   ✗ FAIL — '+(e.message||e));
-        log('\n→ Isolated generation works but the full pipeline fails:');
-        log('  memory pressure or GPU contention from retrieval.'); }
+      }catch(e){ log('   ✗ FAIL — '+(e.message||e)); return done(); }
+
+      log('\n→ All passed in '+((performance.now()-t0)/1000).toFixed(1)+'s. Ready to use.');
+      if(!LLM.device.mt) log('  Note: single-thread mode. Multi-thread would be faster.');
       done();
+    },
+
+    dismissPending: el=>{ UI.clearPending(); el.closest('.dqa-msg')?.remove(); },
+    toggleAutoload: on=>{
+      try{ localStorage.setItem(CFG.AUTOLOAD_KEY, on?'1':'0'); }catch{}
     },
     toggleThinking: on=>{
       ST.thinking = !!on;
       try{ localStorage.setItem(CFG.THINK_PREF_KEY, on?'1':'0'); }catch{}
     },
     switchAndLoad: async id=>{
-      const m=MODELCAT.find(x=>x.id===id); if(!m) return;
-      CFG.LLM_MODEL=id;
-      localStorage.setItem(CFG.MODEL_PREF_KEY,id);
-      ST.llmReady=false; ST.llm=null;
-      UI.refreshModelStatus();
+      await UI.selectModel(id);
       UI.gotoModels();
       await UI.loadModel(id);
     },
@@ -2274,8 +2220,20 @@ init().catch(err=>console.error('[DocQA] init error:',err));
 // (skipped when embedded in PairBoard, which has its own shell)
 // ================================================================
 if('serviceWorker' in navigator && !window.PB){
-  window.addEventListener('load',()=>{
-    navigator.serviceWorker.register('sw.js').catch(e=>console.warn('[DocQA] SW registration failed:',e));
+  window.addEventListener('load',async()=>{
+    try{
+      const reg = await navigator.serviceWorker.register('sw.js');
+      // The COOP/COEP headers the SW injects only apply to responses it
+      // serves, so the first load after install is not yet cross-origin
+      // isolated. Reload once to pick them up and unlock multi-threading.
+      if(!self.crossOriginIsolated && !sessionStorage.getItem('dqa.coiReload')){
+        await navigator.serviceWorker.ready;
+        if(navigator.serviceWorker.controller){
+          sessionStorage.setItem('dqa.coiReload','1');
+          location.reload();
+        }
+      }
+    }catch(e){ console.warn('[DocQA] SW registration failed:',e); }
   });
 }
 
